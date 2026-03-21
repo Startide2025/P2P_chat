@@ -1,0 +1,1472 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>p2p chat</title></head>
+<body style="margin:0;background:#2a2a2a;display:flex;justify-content:center;padding:10px">
+<input type="file" id="ri" accept=".json" style="display:none">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+
+// ================================================================
+//  NETWORKING STATE
+// ================================================================
+const VERSION = 5;
+
+let peer=null, isHost=false, hostConn=null, clientConns=[];
+let clientConnNames=new Map();
+let removedNames=new Set(), permanentBans=new Set(), mutedNames=new Set();
+let hostUsername='';
+
+// ================================================================
+//  ROLE STATE
+// ================================================================
+let persistentOps=new Set(), persistentMods=new Set();
+let sessionOps=new Set(),    sessionMods=new Set();
+
+function loadRoles(rid){
+  try{ const r=JSON.parse(localStorage.getItem('roles:'+rid)||'{}');
+    persistentOps=new Set(r.ops||[]); persistentMods=new Set(r.mods||[]);
+  }catch(e){ persistentOps=new Set(); persistentMods=new Set(); }
+}
+function saveRoles(rid){
+  if(!rid)return;
+  try{ localStorage.setItem('roles:'+rid,JSON.stringify({ops:[...persistentOps],mods:[...persistentMods]})); }catch(e){}
+}
+function clearRoleSets(){ persistentOps=new Set(); persistentMods=new Set(); sessionOps=new Set(); sessionMods=new Set(); }
+
+function _deriveRole(name){
+  if(name===hostUsername) return 'owner';
+  if(persistentOps.has(name))  return 'op';
+  if(sessionOps.has(name))     return 'tempop';
+  if(persistentMods.has(name)) return 'mod';
+  if(sessionMods.has(name))    return 'tempmod';
+  return null;
+}
+function userRole(name){
+  if(name===hostUsername) return 'owner';
+  if(isHost) return _deriveRole(name);
+  return users[name]?.role||null;
+}
+function userRank(name){
+  const r=userRole(name);
+  if(r==='owner')              return 4;
+  if(r==='op'||r==='tempop')   return 3;
+  if(r==='mod'||r==='tempmod') return 2;
+  return 1;
+}
+function myRank(){ return userRank(username); }
+function getRoleBadge(name){
+  const r=userRole(name);
+  return ({owner:{l:'[H]',c:[55,195,210]},op:{l:'[O]',c:[210,175,55]},tempop:{l:'[TO]',c:[170,140,45]},mod:{l:'[M]',c:[100,150,210]},tempmod:{l:'[TM]',c:[75,115,170]}})[r]||null;
+}
+
+// ================================================================
+//  ROLE GRANT / REVOKE
+// ================================================================
+function _silentClearRole(name){
+  persistentOps.delete(name); sessionOps.delete(name);
+  persistentMods.delete(name); sessionMods.delete(name);
+}
+function doGrantRole(name,role){
+  _silentClearRole(name);
+  if(role==='op')           persistentOps.add(name);
+  else if(role==='tempop')  sessionOps.add(name);
+  else if(role==='mod')     persistentMods.add(name);
+  else if(role==='tempmod') sessionMods.add(name);
+  if(role==='op'||role==='mod') saveRoles(roomIdStr);
+  if(users[name]) users[name].role=role;
+  const lbl={op:'operator',tempop:'temp operator',mod:'moderator',tempmod:'temp moderator'}[role]||role;
+  const msg=name+' is now a '+lbl;
+  pushMsg({name:'server',message:msg});
+  broadcastToClients({type:'role_update',name,role},null);
+  broadcastToClients({type:'message',name:'server',message:msg},null);
+}
+function doRevokeRole(name){
+  _silentClearRole(name); saveRoles(roomIdStr);
+  if(users[name]) users[name].role=null;
+  const msg=name+"'s role was revoked";
+  pushMsg({name:'server',message:msg});
+  broadcastToClients({type:'role_update',name,role:null},null);
+  broadcastToClients({type:'message',name:'server',message:msg},null);
+}
+
+// ================================================================
+//  PERM PROXY
+// ================================================================
+function sendOrExecModAction(action,target,roleArg){
+  if(isHost){
+    if(action==='kick')        doKick(target);
+    else if(action==='remove') doRemove(target);
+    else if(action==='ban')    doBan(target);
+    else if(action==='pardon') doPardon(target);
+    else if(action==='mute')   doMute(target);
+    else if(action==='unmute') doUnmute(target);
+    else if(action==='grant')  doGrantRole(target,roleArg);
+    else if(action==='revoke') doRevokeRole(target);
+  } else if(hostConn&&hostConn.open){
+    hostConn.send({type:'mod_action',action,target,actor:username,roleArg:roleArg||null});
+  }
+}
+
+// ================================================================
+//  BANS
+// ================================================================
+function isBlocked(n){ return removedNames.has(n)||permanentBans.has(n); }
+function loadPermanentBans(){
+  try{ const b=JSON.parse(localStorage.getItem('bans')||'[]'); permanentBans=new Set(Array.isArray(b)?b:[]); }
+  catch(e){ permanentBans=new Set(); }
+}
+function savePermanentBans(){
+  try{ localStorage.setItem('bans',JSON.stringify([...permanentBans])); }catch(e){}
+}
+function colorFromId(id){
+  let h=5381; for(let i=0;i<id.length;i++) h=((h<<5)+h)^id.charCodeAt(i);
+  return 'hsl('+((Math.abs(h)%288)+36)+', 58%, 64%)';
+}
+function resolvedColor(id){ const c=fColor.trim(); return c?c:colorFromId(id); }
+function broadcastToClients(data,exceptConn){
+  for(const c of clientConns) if(c!==exceptConn&&c.open) c.send(data);
+}
+function connForName(n){ for(const [c,nm] of clientConnNames) if(nm===n) return c; return null; }
+
+// ================================================================
+//  INCOMING MESSAGE HANDLER
+// ================================================================
+function handleIncoming(data,fromConn){
+  if(data.type==='message'){
+    if(isHost&&mutedNames.has(data.name)) return; // silently drop
+    pushMsg({name:data.name,message:data.message,color:data.color||null,avatar:data.avatar||null});
+    if(isHost) broadcastToClients(data,fromConn);
+
+  } else if(data.type==='user_info'){
+    if(isHost&&data.version!==VERSION){
+      if(fromConn&&fromConn.open){
+        fromConn.send({type:'kick',banType:'version',theirVersion:data.version,ourVersion:VERSION});
+        setTimeout(()=>fromConn.close(),200);
+      }
+      return;
+    }
+    if(isHost&&isBlocked(data.name)){
+      if(fromConn&&fromConn.open){
+        fromConn.send({type:'kick',banType:permanentBans.has(data.name)?'ban':'remove'});
+        setTimeout(()=>fromConn.close(),200);
+      }
+      return;
+    }
+    users[data.name]={color:data.color,online:true,avatar:data.avatar||null,
+      role:isHost?_deriveRole(data.name):(data.role||null)};
+    invalidateAvatarCache(data.name);
+    if(isHost){
+      clientConnNames.set(fromConn,data.name);
+      const jm=data.name+' joined';
+      pushMsg({name:'server',message:jm});
+      broadcastToClients({type:'user_info',name:data.name,color:data.color,
+        avatar:data.avatar||null,role:_deriveRole(data.name)},fromConn);
+      broadcastToClients({type:'message',name:'server',message:jm},fromConn);
+    }
+
+  } else if(data.type==='user_leave'){
+    if(users[data.name]) users[data.name].online=false;
+    pushMsg({name:'server',message:data.name+' left'});
+    if(isHost) broadcastToClients(data,fromConn);
+
+  } else if(data.type==='kick'){
+    const reason=data.banType==='ban'   ?'You were permanently banned from this room.'  :
+                 data.banType==='remove'?'You were removed from this room this session.' :
+                 data.banType==='version'?'Version mismatch: room is v'+data.ourVersion+', you are v'+data.theirVersion+'.' :
+                                         'You were kicked from this room.';
+    pushMsg({name:'server',message:reason});
+    setTimeout(()=>resetToSetup(),1500);
+
+  } else if(data.type==='room_end'){
+    pushMsg({name:'server',message:'Host ended the room.'});
+    setTimeout(()=>resetToSetup(),1500);
+
+  } else if(data.type==='role_update'){
+    if(users[data.name]) users[data.name].role=data.role;
+
+  } else if(data.type==='mod_action'){
+    if(!isHost) return;
+    const actorName=clientConnNames.get(fromConn);
+    if(!actorName||actorName!==data.actor) return;
+    const ar=userRank(actorName), tr=userRank(data.target);
+    if(ar<=tr) return;
+    const act=data.action;
+    if(act==='kick'        &&ar>=2) doKick(data.target);
+    else if(act==='remove' &&ar>=2) doRemove(data.target);
+    else if(act==='mute'   &&ar>=2) doMute(data.target);
+    else if(act==='unmute' &&ar>=2) doUnmute(data.target);
+    else if(act==='ban'    &&ar>=3) doBan(data.target);
+    else if(act==='pardon' &&ar>=3) doPardon(data.target);
+    else if(act==='grant'){
+      const needed=(data.roleArg==='op'||data.roleArg==='tempop')?4:3;
+      if(ar>=needed) doGrantRole(data.target,data.roleArg);
+    } else if(act==='revoke'){
+      const needed=(tr>=3)?4:3;
+      if(ar>=needed) doRevokeRole(data.target);
+    }
+
+  } else if(data.type==='init'){
+    if(data.version!==undefined&&data.version!==VERSION)
+      pushMsg({name:'server',message:'warning: room is v'+data.version+', you are v'+VERSION+' -- things may not work correctly.'});
+    history.length=0; data.history.forEach(m=>pushMsg(m));
+    Object.assign(users,data.users);
+    Object.keys(data.users).forEach(n=>invalidateAvatarCache(n));
+    if(data.hostName) hostUsername=data.hostName;
+
+  } else if(data.type==='become_host'){
+    const origId=data.roomId;
+    history.length=0; data.history.forEach(m=>pushMsg(m));
+    Object.assign(users,data.users);
+    persistentOps=new Set(data.persistentOps||[]);
+    persistentMods=new Set(data.persistentMods||[]);
+    sessionOps=new Set(data.sessionOps||[]);
+    sessionMods=new Set(data.sessionMods||[]);
+    if(hostConn){try{hostConn.close();}catch(e){} hostConn=null;}
+    clientConns=[]; clientConnNames=new Map();
+    if(peer){peer.destroy();peer=null;}
+    function _claimHost(id){
+      peer=new Peer(id,{debug:0});
+      peer.on('open',rid=>{
+        isHost=true; hostUsername=username; roomIdStr=rid;
+        setupHostListeners();
+        roomBarStr=rid+'  |  host  |  '+username;
+        pushMsg({name:'server',message:'You are now the host.'+(rid!==origId?' (new ID: '+rid+')':'')});
+      });
+      peer.on('error',e=>{
+        if(e.type==='unavailable-id'&&id===origId) setTimeout(()=>_claimHost(undefined),400);
+      });
+    }
+    setTimeout(()=>_claimHost(origId),350);
+
+  } else if(data.type==='new_host'){
+    hostUsername=data.name;
+    pushMsg({name:'server',message:data.name+' is now the host.'});
+    if(hostConn){try{hostConn.close();}catch(e){} hostConn=null;}
+    roomIdStr=data.peerId;
+    setTimeout(()=>{
+      const nc=peer.connect(data.peerId,{reliable:true}); hostConn=nc;
+      nc.on('open',()=>{
+        nc.send({type:'user_info',name:username,color:users[username].color,avatar:fAvatar,role:userRole(username),version:VERSION});
+        roomBarStr=data.peerId+'  |  connected  |  '+username;
+      });
+      nc.on('data',  d=>handleIncoming(d,null));
+      nc.on('close',()=>{ if(appState==='chat') pushMsg({name:'server',message:'disconnected from host.'}); });
+      nc.on('error', e=>console.warn('reconnect err',e));
+    },1400);
+
+  } else if(data.type==='whisper'){
+    if(isHost&&data.to!==username){
+      const c=connForName(data.to); if(c&&c.open) c.send(data);
+    } else {
+      pushMsg({type:'whisper',from:data.from,to:data.to,message:data.message});
+    }
+
+  } else if(data.type==='delete_msg'){
+    for(let i=history.length-1;i>=0;i--){
+      const m=history[i];
+      if(m.name===data.name&&m.message===data.message&&m.type===undefined){
+        history.splice(i,1); break;
+      }
+    }
+    if(isHost) broadcastToClients(data,fromConn);
+
+  } else if(data.type==='edit_msg'){
+    for(let i=history.length-1;i>=0;i--){
+      const m=history[i];
+      if(m.name===data.name&&m.message===data.oldMsg&&m.type===undefined){
+        m.message=data.newMsg; break;
+      }
+    }
+    if(isHost) broadcastToClients(data,fromConn);
+
+  } else if(data.type==='mute_update'){
+    if(users[data.name]) users[data.name].muted=data.muted;
+
+  } else if(data.type==='muted'){
+    pushMsg({name:'server',message:data.muted?'You have been muted.':'You have been unmuted.'});
+
+  } else if(data.type==='clear_chat'){
+    history.length=0;
+    pushMsg({name:'server',message:'Chat was cleared by the host.'});
+  }
+}
+
+// ================================================================
+//  HOST LISTENERS
+// ================================================================
+function setupHostListeners(){
+  peer.on('connection',conn=>{
+    if(!isHost){conn.close();return;}
+    conn.on('open',()=>{
+      clientConns.push(conn);
+      conn.send({type:'init',
+        version:VERSION,
+        history:JSON.parse(JSON.stringify(history.filter(m=>m.type!=='_hr'&&m.type!=='_help'))),
+        users:  JSON.parse(JSON.stringify(users)),
+        hostName:username});
+    });
+    conn.on('data',  d=>handleIncoming(d,conn));
+    conn.on('close',()=>{
+      if(!isHost) return;
+      clientConns=clientConns.filter(c=>c!==conn);
+      const name=clientConnNames.get(conn); clientConnNames.delete(conn);
+      if(name&&users[name]&&users[name].online){
+        users[name].online=false;
+        const lm=name+' left';
+        pushMsg({name:'server',message:lm});
+        broadcastToClients({type:'user_leave',name},null);
+      }
+    });
+    conn.on('error',e=>console.warn('[host]',e));
+  });
+}
+
+// ================================================================
+//  KICK / REMOVE / BAN / PARDON / TRANSFER / CLEAR
+// ================================================================
+function _dispatchKick(name,banType){
+  const conn=connForName(name);
+  if(conn&&conn.open){conn.send({type:'kick',banType});setTimeout(()=>conn.close(),200);}
+  if(users[name]) users[name].online=false;
+  const lbl=banType==='ban'?'banned':banType==='remove'?'removed':'kicked';
+  const km=name+' was '+lbl;
+  pushMsg({name:'server',message:km});
+  broadcastToClients({type:'message',name:'server',message:km},conn);
+  broadcastToClients({type:'user_leave',name},conn);
+}
+function doKick(n)   { _dispatchKick(n,'kick'); }
+function doRemove(n) { removedNames.add(n);  _dispatchKick(n,'remove'); }
+function doBan(n)    { _silentClearRole(n); permanentBans.add(n); removedNames.add(n); savePermanentBans(); _dispatchKick(n,'ban'); }
+function doPardon(n) {
+  removedNames.delete(n); permanentBans.delete(n); savePermanentBans();
+  const pm=n+' was pardoned';
+  pushMsg({name:'server',message:pm});
+  broadcastToClients({type:'message',name:'server',message:pm},null);
+}
+function doMute(n) {
+  mutedNames.add(n);
+  if(users[n]) users[n].muted=true;
+  const mm=n+' was muted';
+  pushMsg({name:'server',message:mm});
+  broadcastToClients({type:'mute_update',name:n,muted:true},null);
+  broadcastToClients({type:'message',name:'server',message:mm},null);
+  const conn=connForName(n); if(conn&&conn.open) conn.send({type:'muted',muted:true});
+}
+function doUnmute(n) {
+  mutedNames.delete(n);
+  if(users[n]) users[n].muted=false;
+  const mm=n+' was unmuted';
+  pushMsg({name:'server',message:mm});
+  broadcastToClients({type:'mute_update',name:n,muted:false},null);
+  broadcastToClients({type:'message',name:'server',message:mm},null);
+  const conn=connForName(n); if(conn&&conn.open) conn.send({type:'muted',muted:false});
+}
+
+// ================================================================
+//  PENDING CONFIRM
+// ================================================================
+let pendingConfirm=null;
+function confirmOrExecute(cmd,name,fn){
+  if(pendingConfirm?.cmd===cmd&&pendingConfirm?.name===name){ pendingConfirm=null; fn(); }
+  else { pendingConfirm={cmd,name}; pushMsg({name:'server',message:'type /'+cmd+' '+name+' again to confirm'}); }
+}
+function doTransferHost(name){
+  const conn=connForName(name); pendingConfirm=null;
+  if(!conn||!conn.open) return;
+  const origId=roomIdStr;
+  conn.send({type:'become_host',history:JSON.parse(JSON.stringify(history)),users:JSON.parse(JSON.stringify(users)),
+    roomId:origId,persistentOps:[...persistentOps],persistentMods:[...persistentMods],
+    sessionOps:[...sessionOps],sessionMods:[...sessionMods]});
+  broadcastToClients({type:'new_host',peerId:origId,name},conn);
+  pushMsg({name:'server',message:'Host transferred to '+name});
+  isHost=false; hostUsername=name; clientConns=[]; clientConnNames=new Map();
+  if(peer){peer.destroy();peer=null;}
+  setTimeout(()=>{
+    peer=new Peer(undefined,{debug:0});
+    peer.on('open',()=>{
+      const nc=peer.connect(origId,{reliable:true}); hostConn=nc; roomIdStr=origId;
+      nc.on('open',()=>{ nc.send({type:'user_info',name:username,color:users[username].color,avatar:fAvatar,version:VERSION}); roomBarStr=origId+'  |  connected  |  '+username; });
+      nc.on('data',  d=>handleIncoming(d,null));
+      nc.on('close',()=>{ if(appState==='chat') pushMsg({name:'server',message:'disconnected from host.'}); });
+      nc.on('error', e=>console.warn('xfer reconnect',e));
+    });
+  },1200);
+}
+function doClearChat(){
+  history.length=0; scrollOffset=0;
+  pushMsg({name:'server',message:'Chat cleared.'});
+  broadcastToClients({type:'clear_chat'},null);
+}
+function doDeleteLast(name){
+  for(let i=history.length-1;i>=0;i--){
+    const m=history[i];
+    if(m.name===name&&m.type===undefined){
+      const msg=m.message;
+      history.splice(i,1);
+      const pkt={type:'delete_msg',name,message:msg};
+      if(isHost) broadcastToClients(pkt,null);
+      else if(hostConn&&hostConn.open) hostConn.send(pkt);
+      return true;
+    }
+  }
+  return false;
+}
+function doEditLast(name, newText){
+  for(let i=history.length-1;i>=0;i--){
+    const m=history[i];
+    if(m.name===name&&m.type===undefined){
+      const oldMsg=m.message;
+      m.message=newText;
+      const pkt={type:'edit_msg',name,oldMsg,newMsg:newText};
+      if(isHost) broadcastToClients(pkt,null);
+      else if(hostConn&&hostConn.open) hostConn.send(pkt);
+      return true;
+    }
+  }
+  return false;
+}
+
+// ================================================================
+//  HISTORY
+// ================================================================
+const HISTORY_LIMIT=200;
+function pushMsg(msg){
+  if(!msg.ts) msg.ts = Date.now();
+  const atBottom=scrollOffset===0;
+  history.push(msg);
+  if(history.length>HISTORY_LIMIT) history.splice(0,history.length-HISTORY_LIMIT);
+  if(!atBottom){ scrollOffset+=PADY; clampScroll(); }
+}
+
+// ================================================================
+//  SCROLL
+// ================================================================
+let scrollOffset=0;
+
+function chatAreaH(){ return MAXY-TBOXY-PADY; }
+function getMaxScroll(){ return max(0, history.length*PADY - chatAreaH()); }
+function clampScroll(){ scrollOffset=constrain(scrollOffset,0,getMaxScroll()); }
+
+function mouseWheel(event){
+  if(appState!=='chat') return;
+  scrollOffset=constrain(scrollOffset-event.delta, 0, getMaxScroll());
+  return false;
+}
+
+// ================================================================
+//  AVATAR
+// ================================================================
+const AV_PALETTE=['ERASE',null,'#f0f0f0','#888888','#111111','#e05050','#e09030','#d4c830','#50b050','#40b8c0','#5060d0','#9050c8'];
+const AV_CS=14, AV_PCW=13, AV_PCH=13;
+let fAvatar=null, avPalIdx=1, avatarGfxCache={};
+
+function avGridPos(){ return {gx:MAXX/2-SFW/2, gy:SY_CONT+SFH+16+SFH+10}; }
+function initAvatarDefault(){ fAvatar=new Array(64).fill(resolvedColor('preview')); }
+function getAvPaintColor(){ const p=AV_PALETTE[avPalIdx]; return p==='ERASE'?'':p===null?resolvedColor('preview'):p; }
+function invalidateAvatarCache(name){ delete avatarGfxCache[name]; }
+function getAvatarGfx(name){
+  const av=users[name]?.avatar;
+  if(!av||!av.some(c=>c)) return null;
+  const hash=av.join('|');
+  if(avatarGfxCache[name]?.hash===hash) return avatarGfxCache[name].pg;
+  const pg=createGraphics(8,8); pg.noStroke(); pg.clear();
+  for(let r=0;r<8;r++) for(let c=0;c<8;c++){
+    const col=av[r*8+c]; if(col){pg.fill(col);pg.rect(c,r,1,1);}
+  }
+  avatarGfxCache[name]={pg,hash}; return pg;
+}
+function paintAvatarCell(mx,my,gx,gy){
+  const c=floor((mx-gx)/AV_CS), r=floor((my-gy)/AV_CS);
+  if(c<0||c>7||r<0||r>7) return;
+  if(!fAvatar) initAvatarDefault();
+  fAvatar[r*8+c]=mouseButton===RIGHT?'':getAvPaintColor();
+  saveProfile();
+}
+
+// ================================================================
+//  LOCALSTORAGE
+// ================================================================
+function saveProfile(){
+  try{ localStorage.setItem('profile',JSON.stringify({uname:fUname,color:fColor,avatar:fAvatar})); }catch(e){}
+}
+function loadProfile(){
+  try{
+    const p=JSON.parse(localStorage.getItem('profile')||'null');
+    if(p){ fUname=p.uname||''; fColor=p.color||''; fAvatar=Array.isArray(p.avatar)&&p.avatar.length===64?p.avatar:null; }
+  }catch(e){}
+}
+function saveRoomHistory(rid){
+  try{ localStorage.setItem('room:'+rid,JSON.stringify(history.filter(m=>m.type!=='_hr'&&m.type!=='_help'))); }catch(e){}
+}
+function loadRoomHistory(rid){
+  try{
+    const s=JSON.parse(localStorage.getItem('room:'+rid)||'null');
+    if(Array.isArray(s)&&s.length>0){history.length=0;s.forEach(m=>pushMsg(m));return true;}
+  }catch(e){} return false;
+}
+function loadCreatedRooms(){ try{return JSON.parse(localStorage.getItem('rooms:created')||'[]');}catch(e){return[];} }
+function loadJoinedRooms() { try{return JSON.parse(localStorage.getItem('rooms:joined') ||'[]');}catch(e){return[];} }
+function saveCreatedRoom(id,rname){
+  try{
+    let l=loadCreatedRooms(); const i=l.findIndex(r=>r.id===id), e={id,rname:rname||id,ts:Date.now()};
+    if(i>=0)l[i]=e;else l.unshift(e);
+    localStorage.setItem('rooms:created',JSON.stringify(l.slice(0,10)));
+  }catch(e){}
+}
+function saveJoinedRoom(id){
+  try{
+    let l=loadJoinedRooms(); const i=l.findIndex(r=>r.id===id), e={id,ts:Date.now()};
+    if(i>=0)l[i]=e;else l.unshift(e);
+    localStorage.setItem('rooms:joined',JSON.stringify(l.slice(0,10)));
+  }catch(e){}
+}
+function deleteCreatedRoom(id){
+  try{ localStorage.setItem('rooms:created',JSON.stringify(loadCreatedRooms().filter(r=>r.id!==id))); }catch(e){}
+}
+function deleteJoinedRoom(id){
+  try{ localStorage.setItem('rooms:joined',JSON.stringify(loadJoinedRooms().filter(r=>r.id!==id))); }catch(e){}
+}
+
+// ================================================================
+//  PING
+// ================================================================
+let pingPeer=null, roomStatuses={}, pingTimers={};
+function stopPinging(){
+  Object.values(pingTimers).forEach(t=>clearTimeout(t)); pingTimers={};
+  if(pingPeer){try{pingPeer.destroy();}catch(e){} pingPeer=null;}
+}
+function startPinging(ids){
+  stopPinging(); roomStatuses={};
+  if(!ids||!ids.length) return;
+  ids.forEach(id=>roomStatuses[id]='checking');
+  pingPeer=new Peer(undefined,{debug:0});
+  pingPeer.on('open',()=>{
+    ids.forEach(id=>{
+      try{
+        const c=pingPeer.connect(id,{reliable:false});
+        pingTimers[id]=setTimeout(()=>{ if(roomStatuses[id]==='checking') roomStatuses[id]='offline'; },4000);
+        c.on('open', ()=>{ clearTimeout(pingTimers[id]); roomStatuses[id]='online';  try{c.close();}catch(e){} });
+        c.on('error',()=>{ clearTimeout(pingTimers[id]); roomStatuses[id]='offline'; });
+      }catch(e){ roomStatuses[id]='offline'; }
+    });
+  });
+  pingPeer.on('error',()=>{ ids.forEach(id=>{ if(roomStatuses[id]==='checking') roomStatuses[id]='offline'; }); });
+}
+function startPingingForMode(mode){
+  const r=mode==='create'?loadCreatedRooms():loadJoinedRooms();
+  startPinging(r.map(r=>r.id));
+}
+
+// ================================================================
+//  UI STATE
+// ================================================================
+let appState='setup', setupMode=null, focusField='rname';
+let fUname='', fRname='', fJroom='', fColor='';
+let statusTxt='', statusType='n';
+let roomIdStr='', copyLabel='copy ID', roomBarStr='';
+let onlinePanelOpen=false;
+
+function setStatus(msg,isErr,isOk){ statusTxt=msg; statusType=isErr?'e':isOk?'o':'n'; }
+function resetToSetup(){
+  if(peer){peer.destroy();peer=null;}
+  stopPinging();
+  hostConn=null; clientConns=[]; clientConnNames=new Map();
+  removedNames=new Set(); isHost=false; hostUsername=''; mutedNames=new Set();
+  clearRoleSets();
+  history.length=0; pushMsg({name:'server',message:'Welcome!'});
+  users={server:{color:'gray'}};
+  roomBarStr=''; roomIdStr=''; copyLabel='copy ID';
+  setupMode=null; appState='setup'; onlinePanelOpen=false; pendingConfirm=null;
+  scrollOffset=0;
+  setStatus('');
+}
+
+// ================================================================
+//  LAYOUT CONSTANTS
+// ================================================================
+const MAXX=640,MAXY=550,MARGX=20,MARGY=20,PADY=16,TBOXY=20;
+const HEADER_H=28,FOOTER_H=36;
+const SFW=360,SFH=28,MBW=74,MBH=28,CBW=88,CBH=26;
+const SY_TITLE=150,SY_TAG=174,SY_UNAME=212,SY_MBTNS=254,SY_CONT=296;
+const FB_H=22;
+const SB_W=4, SB_X=MAXX-6;
+
+// ================================================================
+//  ONLINE PANEL GEOMETRY
+// ================================================================
+function getBlockedList(){
+  if(!isHost) return [];
+  const all=new Set([...removedNames,...permanentBans]);
+  return [...all].map(n=>({name:n,type:permanentBans.has(n)?'ban':'remove'}));
+}
+function onlinePanelGeom(ol,fy){
+  const bl=getBlockedList(), hasBlocked=bl.length>0;
+  const panelW=isHost?296:175;
+  const rowH=20, padX=10, padY=8;
+  const blockedOffset=hasBlocked?ol.length*rowH+(ol.length>0?10:0):0;
+  const innerH=hasBlocked?blockedOffset+bl.length*rowH:ol.length*rowH;
+  const panelH=padY+innerH+padY-4;
+  const panelX=MAXX-MARGX-panelW, panelY=fy-panelH-5;
+  const blockedBaseY=hasBlocked?panelY+padY+blockedOffset:0;
+  return {panelW,rowH,padX,padY,panelH,panelX,panelY,bl,hasBlocked,blockedBaseY};
+}
+
+// ================================================================
+//  APP STATE  (user's verbatim vars)
+// ================================================================
+let frame=0, working_text='', username='placeholder';
+let cursorPos=0;
+let undoStack=[], redoStack=[], undoDirty=false;
+let consoleHistory=[], consoleHistIdx=-1, consoleSaved='';
+function undoSnapshot(){ undoStack.push({text:working_text,pos:cursorPos}); redoStack=[]; if(undoStack.length>200) undoStack.shift(); undoDirty=false; }
+function inputSet(text,pos){ working_text=text; cursorPos=pos===undefined?text.length:pos; undoDirty=true; }
+function inputInsert(ch){ undoDirty=true; working_text=working_text.slice(0,cursorPos)+ch+working_text.slice(cursorPos); cursorPos+=ch.length; }
+function inputBackspace(){ if(cursorPos===0)return; undoDirty=true; working_text=working_text.slice(0,cursorPos-1)+working_text.slice(cursorPos); cursorPos--; }
+let _heldKey='', _heldCode=0, _heldTimer=0;
+const _HOLD_DELAY=22, _HOLD_REPEAT=3;
+let users={server:{color:'gray'}};
+let history=[{name:'server',message:'Welcome!'}];
+
+function renderText(txt,y){
+  let x=MARGX, name, message;
+  if(typeof txt==='string'){ message=txt; }
+  else if(txt.type==='whisper'){
+    noStroke(); textSize(12); textAlign(LEFT,BASELINE);
+    if(txt.ts){ const d=new Date(txt.ts),hh=String(d.getHours()).padStart(2,'0'),mm=String(d.getMinutes()).padStart(2,'0'); fill(72); text('['+hh+':'+mm+'] ',x,y-MARGY); x+=textWidth('['+hh+':'+mm+'] '); }
+    fill(color(160,120,200));
+    text('['+txt.from+'>'+txt.to+']: '+txt.message, x, y-MARGY); return;
+  } else if(txt.type==='_hr'){
+    stroke(62); strokeWeight(1); line(MARGX,y-MARGY-6,SB_X-2,y-MARGY-6); return;
+  } else if(txt.type==='_help'){
+    const rc={1:color(120,120,120),2:color(210,165,55),3:color(100,150,210),4:color(55,195,210)};
+    noStroke(); fill(180); textSize(11); textAlign(LEFT,BASELINE); text(txt.cmd,MARGX,y-MARGY);
+    fill(100); textSize(10); text(txt.desc,MARGX+190,y-MARGY);
+    fill(rc[txt.reqRank]||color(80)); noStroke(); ellipse(SB_X-6,y-MARGY-4,5,5);
+    return;
+  } else { ({name,message}=txt); }
+
+  noStroke(); textSize(12); textAlign(LEFT,BASELINE);
+
+  // [HH:MM] prefix
+  if(txt.ts){
+    const d=new Date(txt.ts),hh=String(d.getHours()).padStart(2,'0'),mm=String(d.getMinutes()).padStart(2,'0');
+    fill(72); text('['+hh+':'+mm+'] ',x,y-MARGY); x+=textWidth('['+hh+':'+mm+'] ');
+  }
+
+  const resolvedCol=users[name]?.color||txt.color||'white';
+  const resolvedAv=users[name]?.avatar||txt.avatar||null;
+  if(name&&(users[name]||txt.color)){
+    const pg=resolvedAv?(()=>{
+      const av=resolvedAv, hash=av.join('|');
+      if(avatarGfxCache[name]?.hash===hash) return avatarGfxCache[name].pg;
+      const pg=createGraphics(8,8); pg.noStroke(); pg.clear();
+      for(let r=0;r<8;r++) for(let c=0;c<8;c++){ const col=av[r*8+c]; if(col){pg.fill(col);pg.rect(c,r,1,1);} }
+      avatarGfxCache[name]={pg,hash}; return pg;
+    })():null;
+    if(pg){ noSmooth(); image(pg,x,y-MARGY-10,12,12); smooth(); x+=14; }
+    else  { fill(resolvedCol); noStroke(); ellipse(x+4,y-MARGY-4,7,7); x+=12; }
+  }
+  fill(resolvedCol);
+  text(`${(users[name]||txt.color)?('<'+name+'>: '):''}${message}`, x, y-MARGY);
+}
+
+function setup(){
+  createCanvas(MAXX,MAXY+HEADER_H+FOOTER_H);
+  textFont('monospace'); loadProfile(); loadPermanentBans();
+}
+function keyPressed(){
+  if(appState==='setup') handleSetupKey();
+  else{
+    if(keyCode==ENTER){ undoSnapshot(); if(working_text.trim()){ consoleHistory.unshift(working_text); if(consoleHistory.length>200) consoleHistory.pop(); } consoleHistIdx=-1; consoleSaved=''; handleCommand(working_text); working_text=''; cursorPos=0; undoStack=[]; redoStack=[]; }
+    else if(keyCode==BACKSPACE) return; // handled by native listener
+  }
+  return false;
+}
+function mouseDragged(){
+  if(appState!=='setup'||setupMode!=='profile') return;
+  const {gx,gy}=avGridPos();
+  if(isHov(gx,gy,8*AV_CS,8*AV_CS)){ if(!fAvatar) initAvatarDefault(); paintAvatarCell(mouseX,mouseY,gx,gy); }
+}
+function getCharW(){ textFont('monospace'); textSize(12); return textWidth('M'); }
+
+function drawInput(){
+  const maxW   = SB_X - 2 - MARGX;
+  textFont('monospace'); textSize(12);
+  const charW  = textWidth('M');
+  const lineLen = Math.floor(maxW / charW);
+  const blink  = Math.floor(frame/30)%2===1;
+
+  // wrap working_text into lines
+  const lines = [];
+  let rem = working_text;
+  while(rem.length > lineLen){ lines.push(rem.slice(0, lineLen)); rem = rem.slice(lineLen); }
+  lines.push(rem);
+
+  const baseY = (MAXY + 1.5*PADY) - TBOXY;
+  noStroke(); textAlign(LEFT, BASELINE);
+
+  for(let i=0; i<lines.length; i++){
+    const y     = baseY - (lines.length - 1 - i) * PADY - MARGY;
+    const start = i * lineLen;
+    const end   = start + lines[i].length;
+
+    fill(200);
+    text(lines[i], MARGX, y);
+
+    // cursor on this line?
+    if(cursorPos >= start && cursorPos <= end){
+      const cx = MARGX + textWidth(lines[i].slice(0, cursorPos - start));
+      if(blink){ fill(200); text('|', cx, y); }
+      else     { stroke(80); strokeWeight(1); line(cx, y, cx, y - PADY + 3); noStroke(); }
+    }
+  }
+}
+
+function draw(){
+  background(50); frame++; cursor(ARROW);
+
+  if(appState==='chat'){
+    if(roomIdStr&&frame%300===0) saveRoomHistory(roomIdStr);
+    if(undoDirty&&frame%300===0) undoSnapshot();
+    clampScroll();
+    drawHeader(); drawFooter();
+
+    push(); translate(0,HEADER_H);
+
+    drawingContext.save();
+    drawingContext.beginPath();
+    drawingContext.rect(0,0,MAXX,MAXY);
+    drawingContext.clip();
+
+    for(let i=0;i<history.length;i++){
+      const y=(MAXY-(history.length-1-i)*PADY)-TBOXY+scrollOffset;
+      const baseline=y-MARGY;
+      if(baseline>MAXY+2||baseline<-PADY) continue;
+      renderText(history[i],y);
+    }
+
+    drawingContext.restore();
+
+    drawInput();
+
+    const maxS=getMaxScroll();
+    if(maxS>0){
+      const areaH=MAXY-10;
+      const thumbH=max(20, areaH*(MAXY/(MAXY+maxS)));
+      const thumbT=5+(1-scrollOffset/maxS)*(areaH-thumbH);
+      noStroke(); fill(38); rect(SB_X,5,SB_W,areaH,2);
+      fill(scrollOffset>0?95:55); rect(SB_X,thumbT,SB_W,thumbH,2);
+    }
+
+    if(scrollOffset>0){
+      const bW=58,bH=16,bX=MAXX/2-bW/2,bY=MAXY-TBOXY-bH-6;
+      const hov=mouseX>=bX&&mouseX<=bX+bW&&mouseY-HEADER_H>=bY&&mouseY-HEADER_H<=bY+bH;
+      if(hov) cursor(HAND);
+      strokeWeight(1); stroke(hov?100:65); fill(hov?color(55,58,68):color(35,38,45));
+      rect(bX,bY,bW,bH,3); noStroke();
+      fill(hov?190:120); textSize(10); textAlign(CENTER,CENTER);
+      text('down  latest',bX+bW/2,bY+bH/2);
+    }
+
+    pop();
+  }
+
+  if(appState==='setup') drawSetup();
+}
+
+// ================================================================
+//  SEND & COMMANDS
+// ================================================================
+function wrapMessage(text, name) {
+  const maxW   = SB_X - 2 - MARGX - 14; // 14 = avatar offset
+  const charW  = getCharW();
+  const tsW    = textWidth('[00:00] ');   // fixed-width timestamp prefix
+  const prefix = '<' + name + '>: ';
+  const avail  = maxW - tsW - textWidth(prefix);
+  const lineLen = Math.max(8, Math.floor(avail / charW));
+  if(text.length <= lineLen) return [text];
+  const words = text.split(' ');
+  const lines = [];
+  let line = '';
+  for(const word of words) {
+    if(!line)                                    line = word;
+    else if(line.length+1+word.length <= lineLen) line += ' ' + word;
+    else                                         { lines.push(line); line = word; }
+    while(line.length > lineLen){ lines.push(line.slice(0, lineLen)); line = line.slice(lineLen); }
+  }
+  if(line) lines.push(line);
+  return lines;
+}
+
+function send(msg, name) {
+  if(!msg || !msg.trim()) return;
+  const col    = users[name]?.color  || null;
+  const avatar = users[name]?.avatar || null;
+  for(const line of wrapMessage(msg.trim(), name)) {
+    pushMsg({name, message:line, color:col, avatar});
+    const p = {type:'message', name, message:line, color:col, avatar};
+    if(isHost) broadcastToClients(p, null);
+    else if(hostConn && hostConn.open) hostConn.send(p);
+  }
+}
+function resolveOnlineUser(name){
+  if(!name) return null;
+  const ol=getOnlineList();
+  return (ol.find(u=>u.name===name)||ol.find(u=>u.name.toLowerCase()===name.toLowerCase()))?.name??null;
+}
+function doWhisper(to,message){
+  if(to===username){ pushMsg({name:'server',message:"you can't whisper to yourself"}); return; }
+  pushMsg({type:'whisper',from:username,to,message});
+  const pkt={type:'whisper',from:username,to,message};
+  if(isHost){ const c=connForName(to); if(c&&c.open) c.send(pkt); }
+  else if(hostConn&&hostConn.open) hostConn.send(pkt);
+}
+
+function showHelp(rank){
+  function hr(){ pushMsg({type:'_hr'}); }
+  function row(cmd,desc,r){ pushMsg({type:'_help',cmd,desc,reqRank:r}); }
+  hr();
+  row('/h  /help',            'show this help',              1);
+  row('/w  /whisper <n> <m>', 'send a private message',      1);
+  row('/q  /exit',            'leave or end room',           1);
+  row('/e  /edit <new text>', 'edit your last message',      1);
+  row('/d  /delete',          'delete your last message',    1);
+  row('/bk  /backup',         'download chat backup',        1);
+  hr();
+  if(rank>=2){
+    row('/d  /delete <n>',    'delete last message of user', 2);
+    row('/mu  /mute <n>',        'mute a user',               2);
+    row('/um  /unmute <n>',      'unmute a user',             2);
+    row('/k  /kick <n>',         'kick (can rejoin)',         2);
+    row('/r  /rem  /remove <n>', 'remove for this session',   2);
+    hr();
+  }
+  if(rank>=3){
+    row('/e  /edit <n> <txt>', 'edit last message of user',  3);
+    row('/b  /ban <n>',          'permanent ban',             3);
+    row('/p  /pdn  /pardon <n>', 'pardon a banned user',      3);
+    row('/tm  /tempmod <n>',     'temp mod (this session)',   3);
+    row('/m  /mod <n>',          'make permanent mod',        3);
+    row('/dm  /demod <n>',       'remove mod role',           3);
+    hr();
+  }
+  if(rank>=4){
+    row('/to  /tempop <n>',  'temp op (this session)',        4);
+    row('/o  /op <n>',       'make permanent op',             4);
+    row('/do  /deop <n>',    'remove op role',                4);
+    row('/owner <n>',        'transfer ownership',            4);
+    row('/c  /clr  /clear',  'clear chat history',            4);
+    row('/rs  /restore',     'restore chat from file',        4);
+    row('/end',              'end room for everyone',         4);
+    hr();
+  }
+
+}
+
+function handleCommand(text){
+  if(!text||!text.trim()) return;
+  if(!text.startsWith('/')){ send(text,username); return; }
+  const parts=text.trim().slice(1).split(/\s+/);
+  const cmd=parts[0].toLowerCase(), arg1=parts[1]||'', rest=parts.slice(2).join(' ');
+  const rank=myRank();
+
+  function needRank(r,lbl){ if(rank<r){ pushMsg({name:'server',message:'requires '+lbl}); return false; } return true; }
+  function resolveTarget(arg){ const t=resolveOnlineUser(arg); if(!t){ pushMsg({name:'server',message:'user not found: '+arg}); return null; } return t; }
+  function rankCheck(t,ar){ if(userRank(t)>=ar){ pushMsg({name:'server',message:'cannot target '+t+': outranks you'}); return false; } return true; }
+
+  if(cmd==='mu'||cmd==='mute'){
+    if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('mute',t);
+  } else if(cmd==='um'||cmd==='umu'||cmd==='unmute'){
+    if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; sendOrExecModAction('unmute',t);
+  } else if(cmd==='k'||cmd==='kick'){
+    if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('kick',t);
+  } else if(cmd==='r'||cmd==='rem'||cmd==='remove'){
+    if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('remove',t);
+  } else if(cmd==='b'||cmd==='ban'){
+    if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('ban',t);
+  } else if(cmd==='p'||cmd==='pdn'||cmd==='pardon'){
+    if(!needRank(3,'operator'))return; if(!arg1){pushMsg({name:'server',message:'usage: /pardon <name>'});return;} sendOrExecModAction('pardon',arg1);
+  } else if(cmd==='tm'||cmd==='tempmod'){
+    if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return;
+    confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'tempmod'));
+  } else if(cmd==='m'||cmd==='mod'){
+    if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return;
+    confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'mod'));
+  } else if(cmd==='dm'||cmd==='demod'){
+    if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return;
+    if(userRank(t)!==2){pushMsg({name:'server',message:arg1+' is not a moderator'});return;}
+    confirmOrExecute(cmd,t,()=>sendOrExecModAction('revoke',t,'mod'));
+  } else if(cmd==='to'||cmd==='tempop'){
+    if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return;
+    confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'tempop'));
+  } else if(cmd==='o'||cmd==='op'){
+    if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return;
+    confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'op'));
+  } else if(cmd==='do'||cmd==='deop'){
+    if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return;
+    if(userRank(t)!==3){pushMsg({name:'server',message:arg1+' is not an operator'});return;}
+    confirmOrExecute(cmd,t,()=>sendOrExecModAction('revoke',t,'op'));
+  } else if(cmd==='owner'){
+    if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return;
+    confirmOrExecute(cmd,t,()=>doTransferHost(t));
+  } else if(cmd==='w'||cmd==='whisper'){
+    const t=resolveTarget(arg1);if(!t)return;
+    if(!rest){pushMsg({name:'server',message:'usage: /w <name> <message>'});return;}
+    doWhisper(t,rest);
+  } else if(cmd==='q'||cmd==='quit'||cmd==='exit'||cmd==='nuh'){
+    rank>=4?doEndRoom():doLeave();
+  } else if(cmd==='end'){ if(!needRank(4,'owner'))return; doEndRoom();
+  } else if(cmd==='e'||cmd==='edit'){
+    const newText = arg1 ? parts.slice(1).join(' ') : '';
+    if(!newText){ pushMsg({name:'server',message:'usage: /e <new text>  or  /e <name> <new text> (op+)'}); return; }
+    // check if first arg is an online user name (op+ targeted edit)
+    const maybeTarget = resolveOnlineUser(arg1);
+    if(maybeTarget && maybeTarget!==username && parts.length>2){
+      if(!needRank(3,'operator'))return;
+      if(!rankCheck(maybeTarget,rank))return;
+      const editText=parts.slice(2).join(' ');
+      if(!doEditLast(maybeTarget,editText)) pushMsg({name:'server',message:'no messages found for '+maybeTarget});
+    } else {
+      if(!doEditLast(username, newText)) pushMsg({name:'server',message:'nothing to edit'});
+    }
+  } else if(cmd==='d'||cmd==='delete'){
+    if(arg1){
+      if(!needRank(2,'moderator'))return;
+      const t=resolveTarget(arg1); if(!t)return;
+      if(!rankCheck(t,rank))return;
+      if(!doDeleteLast(t)) pushMsg({name:'server',message:'no messages found for '+t});
+    } else {
+      if(!doDeleteLast(username)) pushMsg({name:'server',message:'nothing to delete'});
+    }
+  } else if(cmd==='c'||cmd==='clr'||cmd==='clear'){ if(!needRank(4,'owner'))return; doClearChat();
+  } else if(cmd==='bk'||cmd==='backup'){
+    const blob=new Blob([JSON.stringify({history,users},null,2)],{type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    Object.assign(document.createElement('a'),{href:url,download:'chat-backup-'+Date.now()+'.json'}).click();
+    URL.revokeObjectURL(url);
+  } else if(cmd==='rs'||cmd==='restore'){ if(!needRank(4,'owner'))return; document.getElementById('ri').click();
+  } else if(cmd==='h'||cmd==='help'){ showHelp(rank);
+  } else { pushMsg({name:'server',message:'unknown command: /'+cmd}); }
+}
+
+// ================================================================
+//  P5 UI PRIMITIVES
+// ================================================================
+function isHov(x,y,w,h){ return mouseX>=x&&mouseX<=x+w&&mouseY>=y&&mouseY<=y+h; }
+function uiBtn(label,x,y,w,h,active){
+  const hov=isHov(x,y,w,h); if(hov)cursor(HAND);
+  strokeWeight(1); stroke(active?color(115,182,115):(hov?125:72));
+  fill(active?42:(hov?68:50)); rect(x,y,w,h,2); noStroke();
+  fill(active?color(115,182,115):(hov?228:148));
+  textSize(11); textAlign(CENTER,CENTER); text(label,x+w/2,y+h/2); return hov;
+}
+function uiField(val,x,y,w,h,ph,focused){
+  const cur=focused&&Math.floor(frame/30)%2===1?'|':'';
+  strokeWeight(1); stroke(focused?108:58); fill(focused?40:28); rect(x,y,w,h,2);
+  noStroke(); textSize(12); textAlign(LEFT,CENTER);
+  if(val.length>0){fill(210);text(val+cur,x+8,y+h/2);}else{fill(62);text(ph+cur,x+8,y+h/2);}
+}
+function uiFieldLocked(val,x,y,w,h){
+  strokeWeight(1); stroke(38); fill(20); rect(x,y,w,h,2);
+  noStroke(); textSize(12); textAlign(LEFT,CENTER);
+  if(val.length>0){fill(85);text(val,x+8,y+h/2);}else{fill(50);text('no username set',x+8,y+h/2);}
+  textAlign(RIGHT,CENTER); fill(45); textSize(10); text('[set in Profile]',x+w-6,y+h/2);
+}
+function uiLabel(txt,x,y){ noStroke(); fill(85); textSize(9); textAlign(LEFT,CENTER); text(txt,x,y); }
+function _tintBtn(label,x,y,w,h,rc,gc,bc,lightText){
+  const hov=isHov(x,y,w,h); if(hov)cursor(HAND);
+  strokeWeight(1);
+  stroke(hov?color(rc,gc,bc):color(rc*.54,gc*.54,bc*.54));
+  fill(hov?color(rc*.30,gc*.30,bc*.30):color(rc*.15,gc*.15,bc*.15));
+  rect(x,y,w,h,2); noStroke();
+  if(lightText) fill(hov?color(210,210,215):color(130,130,140));
+  else fill(hov?color(rc,gc,bc):color(rc*.60,gc*.60,bc*.60));
+  textSize(9); textAlign(CENTER,CENTER); text(label,x+w/2,y+h/2); return hov;
+}
+const uiKickBtn   = (l,x,y,w,h)      => _tintBtn(l,x,y,w,h,210,165, 55,false);
+const uiRemoveBtn = (l,x,y,w,h)      => _tintBtn(l,x,y,w,h,210, 70, 70,false);
+const uiBanBtn    = (l,x,y,w,h)      => _tintBtn(l,x,y,w,h, 55, 55, 68,true);
+const uiMuteBtn   = (l,x,y,w,h,on)   => _tintBtn(l,x,y,w,h,on?190:80,on?140:130,on?40:150,false);
+const uiPardonBtn = (l,x,y,w,h)      => _tintBtn(l,x,y,w,h, 80,185, 80,false);
+const uiModBtn    = (l,x,y,w,h,conf) => _tintBtn(l,x,y,w,h,conf?100:60,conf?150:90,conf?210:160,false);
+const uiOpBtn     = (l,x,y,w,h,conf) => _tintBtn(l,x,y,w,h,conf?210:140,conf?175:115,conf?55:30,false);
+const uiHostBtn   = (l,x,y,w,h,conf) => _tintBtn(l,x,y,w,h,conf?80:45,conf?225:170,conf?235:195,false);
+function uiClearBtn(x,y,w,h){ return _tintBtn('[clr]',x,y,w,h,190,110,40,false); }
+
+// ================================================================
+//  AVATAR EDITOR
+// ================================================================
+function drawAvatarEditor(fx,cy){
+  if(!fAvatar) initAvatarDefault();
+  uiLabel('avatar  (left-click paint  |  right-click erase)',fx,cy-7);
+  for(let r=0;r<8;r++) for(let c=0;c<8;c++){
+    const i=r*8+c, x=fx+c*AV_CS, y=cy+r*AV_CS;
+    strokeWeight(0.5); stroke(35); fill(fAvatar[i]||25); rect(x,y,AV_CS,AV_CS);
+  }
+  const {gx,gy}=avGridPos();
+  if(isHov(gx,gy,8*AV_CS,8*AV_CS)){
+    const c=floor((mouseX-gx)/AV_CS), r=floor((mouseY-gy)/AV_CS);
+    if(c>=0&&c<8&&r>=0&&r<8){ cursor(CROSS); noFill(); stroke(180,180,180,120); strokeWeight(1); rect(gx+c*AV_CS,gy+r*AV_CS,AV_CS,AV_CS); }
+  }
+  const px=fx+8*AV_CS+5;
+  for(let i=0;i<AV_PALETTE.length;i++){
+    const pr=floor(i/2), pc=i%2, bx=px+pc*(AV_PCW+2), by=cy+pr*(AV_PCH+2), sel=i===avPalIdx;
+    if(isHov(bx,by,AV_PCW,AV_PCH)) cursor(HAND);
+    const pval=AV_PALETTE[i];
+    if(pval==='ERASE'){
+      strokeWeight(sel?2:0.5); stroke(sel?220:55); fill(18); rect(bx,by,AV_PCW,AV_PCH,1);
+      noStroke(); fill(45); rect(bx,by,AV_PCW/2,AV_PCH/2); rect(bx+AV_PCW/2,by+AV_PCH/2,AV_PCW/2,AV_PCH/2);
+      fill(130); textSize(8); textAlign(CENTER,CENTER); text('x',bx+AV_PCW/2,by+AV_PCH/2+1);
+    } else {
+      const col=pval===null?resolvedColor('preview'):pval;
+      strokeWeight(sel?2:0.5); stroke(sel?220:55); fill(col); rect(bx,by,AV_PCW,AV_PCH,1);
+    }
+  }
+  const btnY=cy+8*AV_CS+6;
+  uiBtn('fill all',fx,btnY,53,18);
+  uiBtn('clear',fx+57,btnY,53,18);
+}
+
+// ================================================================
+//  ROOM LIST
+// ================================================================
+function roomListLayout(mode,startCy){
+  const rooms=mode==='create'?loadCreatedRooms():loadJoinedRooms();
+  if(!rooms.length) return null;
+  const fx=MAXX/2-SFW/2, labelY=startCy+8;
+  return {labelY, rows:rooms.map((r,i)=>({room:r,y:labelY+14+i*22})), fx};
+}
+function drawRoomList(mode,startCy){
+  const layout=roomListLayout(mode,startCy); if(!layout) return;
+  const {labelY,rows,fx}=layout;
+  noStroke(); fill(55); textSize(9); textAlign(LEFT,CENTER);
+  text(mode==='create'?'YOUR ROOMS':'KNOWN ROOMS',fx,labelY);
+  for(const {room,y} of rows){
+    const st=roomStatuses[room.id]||'checking', hov=isHov(fx,y,SFW,20);
+    const delX=fx+SFW-18, delHov=isHov(delX,y+3,14,14);
+    if(hov&&!delHov) cursor(HAND);
+    strokeWeight(1); stroke(hov?72:42); fill(hov?38:28); rect(fx,y,SFW,20,2); noStroke();
+    fill(st==='online'?color(78,160,78):st==='offline'?color(140,58,58):color(155,140,45));
+    ellipse(fx+12,y+10,7,7);
+    fill(hov&&!delHov?210:148); textSize(10); textAlign(LEFT,CENTER);
+    const lbl=room.rname&&room.rname!==room.id?room.rname:room.id;
+    text(lbl.length>34?lbl.slice(0,32)+'..':lbl,fx+22,y+10);
+    if(delHov) cursor(HAND);
+    strokeWeight(1); stroke(delHov?color(200,80,80):color(90,40,40));
+    fill(delHov?color(80,20,20):color(35,15,15)); rect(delX,y+3,14,14,2);
+    noStroke(); fill(delHov?color(230,110,110):color(140,60,60));
+    textSize(11); textAlign(CENTER,CENTER); text('x',delX+7,y+10);
+  }
+}
+
+// ================================================================
+//  SETUP SCREEN
+// ================================================================
+function drawSetup(){
+  noStroke(); fill(0,0,0,215); rect(0,0,MAXX,height);
+  const cx=MAXX/2, fx=cx-SFW/2;
+  noStroke(); fill(115,182,115); textSize(21); textAlign(CENTER,CENTER); text('p2p chat',cx,SY_TITLE);
+  fill(72); textSize(9); text('P E E R  *  T O  *  P E E R  *  D I R E C T',cx,SY_TAG);
+  if(setupMode!=='profile') uiFieldLocked(fUname,fx,SY_UNAME,SFW,SFH);
+  const mb1x=cx-117, mb2x=cx-37, mb3x=cx+43;
+  uiBtn('Create Room',mb1x,SY_MBTNS,MBW,MBH,setupMode==='create');
+  uiBtn('Join Room',  mb2x,SY_MBTNS,MBW,MBH,setupMode==='join');
+  uiBtn('Profile',    mb3x,SY_MBTNS,MBW,MBH,setupMode==='profile');
+  let cy=SY_CONT;
+  if(setupMode==='create'){
+    uiField(fRname,fx,cy,SFW,SFH,'room name (optional)',focusField==='rname'); cy+=SFH+10;
+    uiBtn('Create',cx-CBW/2,cy,CBW,CBH); cy+=CBH+12;
+    drawRoomList('create',cy);
+  }
+  if(setupMode==='join'){
+    uiField(fJroom,fx,cy,SFW,SFH,'room id',focusField==='jroom'); cy+=SFH+10;
+    uiBtn('Connect',cx-CBW/2,cy,CBW,CBH); cy+=CBH+12;
+    drawRoomList('join',cy);
+  }
+  if(setupMode==='profile'){
+    uiLabel('username',fx,cy-7);
+    uiField(fUname,fx,cy,SFW,SFH,'username',focusField==='uname'); cy+=SFH+16;
+    uiLabel('color  (hex, hsl, or css name -- leave empty for auto)',fx,cy-7);
+    const cfw=SFW-SFH-8;
+    uiField(fColor,fx,cy,cfw,SFH,'auto',focusField==='color');
+    strokeWeight(1); stroke(72);
+    try{ fill(fColor.trim()?color(fColor.trim()):color(colorFromId('preview'))); }catch(e){ fill(60); }
+    rect(fx+cfw+8,cy,SFH,SFH,2); cy+=SFH+10;
+    drawAvatarEditor(fx,cy); cy+=8*AV_CS+6+18+8;
+  }
+  noStroke();
+  fill(statusType==='e'?color(185,85,85):statusType==='o'?color(95,165,95):color(95));
+  textSize(11); textAlign(CENTER,CENTER); text(statusTxt,cx,cy);
+}
+
+// ================================================================
+//  CHAT HEADER & FOOTER
+// ================================================================
+function drawHeader(){
+  noStroke(); fill(32); rect(0,0,MAXX,HEADER_H);
+  stroke(55); strokeWeight(1); line(0,HEADER_H,MAXX,HEADER_H); noStroke();
+  fill(roomBarStr?148:60); textSize(11); textAlign(LEFT,CENTER);
+  text(roomBarStr||'not connected',MARGX,HEADER_H/2);
+  if(isHost&&roomIdStr){ uiBtn(copyLabel,MAXX-MARGX-52,(HEADER_H-16)/2,52,16); }
+}
+function getOnlineList(){
+  return Object.entries(users).filter(([k,v])=>k!=='server'&&v.online).map(([k,v])=>({name:k,color:v.color}));
+}
+function footerBtns(){
+  if(isHost) return [
+    {id:'bk', label:'[bk]',       x:20, w:46},
+    {id:'rs', label:'[rs]',       x:70, w:46},
+    {id:'clr',label:'[clr]',      x:120,w:42,tint:true},
+    {id:'end',label:'[end room]', x:166,w:82},
+  ];
+  return [{id:'leave',label:'[leave]',x:20,w:72}];
+}
+function drawFooter(){
+  const fy=MAXY+HEADER_H;
+  noStroke(); fill(32); rect(0,fy,MAXX,FOOTER_H);
+  stroke(55); strokeWeight(1); line(0,fy,MAXX,fy); noStroke();
+  const by=fy+(FOOTER_H-FB_H)/2;
+  for(const b of footerBtns()){ if(b.tint) uiClearBtn(b.x,by,b.w,FB_H); else uiBtn(b.label,b.x,by,b.w,FB_H); }
+
+  const ol=getOnlineList(), g=onlinePanelGeom(ol,fy);
+  const obW=76, obx=MAXX-MARGX-obW;
+  if(isHov(obx,by,obW,FB_H)) cursor(HAND);
+  uiBtn(ol.length+' online',obx,by,obW,FB_H,onlinePanelOpen);
+
+  if(onlinePanelOpen&&(ol.length>0||g.hasBlocked)){
+    strokeWeight(1); stroke(65); fill(24); rect(g.panelX,g.panelY,g.panelW,g.panelH,3); noStroke();
+    const bH=14, bBX=g.panelX+g.panelW-4-14, bRX=bBX-2-14, bKX=bRX-2-14, bHX=bKX-2-14, bOX=bHX-2-14, bMX=bOX-2-14, bMUX=bMX-2-14;
+    for(let i=0;i<ol.length;i++){
+      const u=ol[i], ry=g.panelY+g.padY+i*g.rowH;
+      const confOwner=isHost&&pendingConfirm?.cmd==='owner'&&pendingConfirm?.name===u.name;
+      const confMod  =isHost&&pendingConfirm?.cmd==='mod'  &&pendingConfirm?.name===u.name;
+      const confOp   =isHost&&pendingConfirm?.cmd==='op'   &&pendingConfirm?.name===u.name;
+      if(confOwner){ noStroke(); fill(15,65,75,100);  rect(g.panelX+2,ry,g.panelW-4,g.rowH,2); }
+      if(confMod)  { noStroke(); fill(15,30,65,100);  rect(g.panelX+2,ry,g.panelW-4,g.rowH,2); }
+      if(confOp)   { noStroke(); fill(50,35,10,100);  rect(g.panelX+2,ry,g.panelW-4,g.rowH,2); }
+      const pg=getAvatarGfx(u.name);
+      if(pg){ noSmooth(); image(pg,g.panelX+g.padX,ry+3,14,14); smooth(); }
+      else  { fill(u.color); ellipse(g.panelX+g.padX+4,ry+8,8,8); }
+      let nameX=g.panelX+g.padX+18;
+      const badge=getRoleBadge(u.name);
+      if(badge){ fill(color(...badge.c)); textSize(9); textAlign(LEFT,TOP); text(badge.l,nameX,ry+3); nameX+=badge.l.length>3?30:24; }
+      fill(190); textSize(11); textAlign(LEFT,TOP);
+      const rightBtnsW=isHost&&u.name!==username?4+14+2+14+2+14+2+14+2+14+2+14+2+14:4;
+      const maxChars=max(4,floor((g.panelX+g.panelW-rightBtnsW-nameX)/7));
+      text(u.name.length>maxChars?u.name.slice(0,maxChars-1)+'...':u.name,nameX,ry+2);
+      if(isHost&&u.name!==username){
+        const isMuted=isHost?mutedNames.has(u.name):!!(users[u.name]?.muted);
+        uiMuteBtn(isMuted?'UM':'MU',bMUX,ry+3,14,bH,isMuted);
+        uiModBtn ('M',bMX,ry+3,14,bH,confMod);
+        uiOpBtn  ('O',bOX,ry+3,14,bH,confOp);
+        uiHostBtn('H',bHX,ry+3,14,bH,confOwner);
+        uiKickBtn  ('K',bKX,ry+3,14,bH);
+        uiRemoveBtn('R',bRX,ry+3,14,bH);
+        uiBanBtn   ('B',bBX,ry+3,14,bH);
+      }
+    }
+    if(g.hasBlocked){
+      if(ol.length>0){ const dY=g.panelY+g.padY+ol.length*g.rowH+5; stroke(52);strokeWeight(1);line(g.panelX+6,dY,g.panelX+g.panelW-6,dY);noStroke(); }
+      const pdnW=22, pdnX=g.panelX+g.panelW-4-pdnW;
+      for(let i=0;i<g.bl.length;i++){
+        const b=g.bl[i], ry=g.blockedBaseY+i*g.rowH;
+        fill(b.type==='ban'?color(150,55,55):color(150,118,40));
+        textSize(8);textAlign(LEFT,TOP);text(b.type==='ban'?'ban':'rm',g.panelX+g.padX,ry+4);
+        fill(115);textSize(11);textAlign(LEFT,TOP);text(b.name,g.panelX+g.padX+22,ry+2);
+        uiPardonBtn('pdn',pdnX,ry+3,pdnW,bH);
+      }
+    }
+  }
+}
+
+// ================================================================
+//  MOUSE CLICKS
+// ================================================================
+function mousePressed(){
+  if(appState==='setup') handleSetupClick();
+  else handleChatClick();
+}
+function doubleClicked(){
+  if(appState!=='setup') return;
+  const fx=MAXX/2-SFW/2; let cy=SY_CONT;
+  if(setupMode==='create'){
+    cy+=SFH+10+CBH+12;
+    const l=roomListLayout('create',cy);
+    if(l) for(const {room,y} of l.rows) if(isHov(fx,y,SFW-18,20)){ fRname=room.rname!==room.id?room.rname:room.id; doCreateRoom(); return; }
+  }
+  if(setupMode==='join'){
+    cy+=SFH+10+CBH+12;
+    const l=roomListLayout('join',cy);
+    if(l) for(const {room,y} of l.rows) if(isHov(fx,y,SFW-18,20)){ fJroom=room.id; doJoinRoom(); return; }
+  }
+}
+
+function handleSetupClick(){
+  const cx=MAXX/2, fx=cx-SFW/2;
+  const mb1x=cx-117, mb2x=cx-37, mb3x=cx+43;
+  if(isHov(mb1x,SY_MBTNS,MBW,MBH)){ if(setupMode!=='create'){setupMode='create';focusField='rname';setStatus('');startPingingForMode('create');} return; }
+  if(isHov(mb2x,SY_MBTNS,MBW,MBH)){ if(setupMode!=='join')  {setupMode='join';  focusField='jroom';setStatus('');startPingingForMode('join');  } return; }
+  if(isHov(mb3x,SY_MBTNS,MBW,MBH)){ if(setupMode!=='profile'){setupMode='profile';focusField='uname';stopPinging();setStatus('');} return; }
+  let cy=SY_CONT;
+  if(setupMode==='create'){
+    if(isHov(fx,cy,SFW,SFH)){focusField='rname';return;} cy+=SFH+10;
+    if(isHov(cx-CBW/2,cy,CBW,CBH)){doCreateRoom();return;} cy+=CBH+12;
+    const l=roomListLayout('create',cy);
+    if(l) for(const {room,y} of l.rows){
+      if(isHov(fx+SFW-18,y+3,14,14)){deleteCreatedRoom(room.id);delete roomStatuses[room.id];return;}
+      if(isHov(fx,y,SFW-18,20)){fRname=room.rname!==room.id?room.rname:room.id;focusField='rname';return;}
+    }
+  }
+  if(setupMode==='join'){
+    if(isHov(fx,cy,SFW,SFH)){focusField='jroom';return;} cy+=SFH+10;
+    if(isHov(cx-CBW/2,cy,CBW,CBH)){doJoinRoom();return;} cy+=CBH+12;
+    const l=roomListLayout('join',cy);
+    if(l) for(const {room,y} of l.rows){
+      if(isHov(fx+SFW-18,y+3,14,14)){deleteJoinedRoom(room.id);delete roomStatuses[room.id];return;}
+      if(isHov(fx,y,SFW-18,20)){fJroom=room.id;focusField='jroom';return;}
+    }
+  }
+  if(setupMode==='profile'){
+    if(isHov(fx,cy,SFW,SFH)){focusField='uname';return;} cy+=SFH+16;
+    const cfw=SFW-SFH-8;
+    if(isHov(fx,cy,cfw,SFH)){focusField='color';return;} cy+=SFH+10;
+    const {gx,gy}=avGridPos();
+    const ppx=gx+8*AV_CS+5;
+    for(let i=0;i<AV_PALETTE.length;i++){
+      const pr=floor(i/2),pc=i%2,bx=ppx+pc*(AV_PCW+2),by=gy+pr*(AV_PCH+2);
+      if(isHov(bx,by,AV_PCW,AV_PCH)){avPalIdx=i;return;}
+    }
+    if(isHov(gx,gy,8*AV_CS,8*AV_CS)){ if(!fAvatar) initAvatarDefault(); paintAvatarCell(mouseX,mouseY,gx,gy); return; }
+    const btnY=gy+8*AV_CS+6;
+    if(isHov(gx,btnY,53,18)){fAvatar=new Array(64).fill(getAvPaintColor());saveProfile();return;}
+    if(isHov(gx+57,btnY,53,18)){fAvatar=new Array(64).fill('');saveProfile();return;}
+  }
+}
+
+function handleChatClick(){
+  const fy=MAXY+HEADER_H, by=fy+(FOOTER_H-FB_H)/2;
+
+  if(isHost&&roomIdStr&&isHov(MAXX-MARGX-52,(HEADER_H-16)/2,52,16)){
+    navigator.clipboard.writeText(roomIdStr).then(()=>{copyLabel='Copied!';setTimeout(()=>{copyLabel='copy ID';},2000);}); return;
+  }
+  for(const b of footerBtns()){
+    if(!isHov(b.x,by,b.w,FB_H)) continue;
+    if(b.id==='bk'){ const blob=new Blob([JSON.stringify({history,users},null,2)],{type:'application/json'}); const url=URL.createObjectURL(blob); Object.assign(document.createElement('a'),{href:url,download:'chat-backup-'+Date.now()+'.json'}).click(); URL.revokeObjectURL(url); }
+    else if(b.id==='rs') document.getElementById('ri').click();
+    else if(b.id==='clr') doClearChat();
+    else if(b.id==='end') doEndRoom();
+    else if(b.id==='leave') doLeave();
+    return;
+  }
+
+  if(scrollOffset>0){
+    const bW=58,bH=16,bX=MAXX/2-bW/2,bY=MAXY-TBOXY-bH-6;
+    if(mouseX>=bX&&mouseX<=bX+bW&&mouseY-HEADER_H>=bY&&mouseY-HEADER_H<=bY+bH){
+      scrollOffset=0; return;
+    }
+  }
+
+  const obW=76, obx=MAXX-MARGX-obW;
+  if(isHov(obx,by,obW,FB_H)){onlinePanelOpen=!onlinePanelOpen;pendingConfirm=null;return;}
+  if(onlinePanelOpen){
+    const ol=getOnlineList(), g=onlinePanelGeom(ol,fy);
+    if(isHov(g.panelX,g.panelY,g.panelW,g.panelH)){
+      if(isHost){
+        const bH=14,bBX=g.panelX+g.panelW-4-14,bRX=bBX-2-14,bKX=bRX-2-14,bHX=bKX-2-14,bOX=bHX-2-14,bMX=bOX-2-14,bMUX=bMX-2-14;
+        for(let i=0;i<ol.length;i++){
+          const u=ol[i]; if(u.name===username) continue;
+          const ry=g.panelY+g.padY+i*g.rowH;
+          if(isHov(bMUX,ry+3,14,bH)){
+            mutedNames.has(u.name)?doUnmute(u.name):doMute(u.name); pendingConfirm=null; return;
+          }
+          if(isHov(bMX,ry+3,14,bH)){
+            if(pendingConfirm?.cmd==='mod'&&pendingConfirm?.name===u.name){
+              pendingConfirm=null;
+              userRank(u.name)===2?sendOrExecModAction('revoke',u.name):sendOrExecModAction('grant',u.name,'mod');
+            } else pendingConfirm={cmd:'mod',name:u.name};
+            return;
+          }
+          if(isHov(bOX,ry+3,14,bH)){
+            if(pendingConfirm?.cmd==='op'&&pendingConfirm?.name===u.name){
+              pendingConfirm=null;
+              userRank(u.name)===3?sendOrExecModAction('revoke',u.name):sendOrExecModAction('grant',u.name,'op');
+            } else pendingConfirm={cmd:'op',name:u.name};
+            return;
+          }
+          if(isHov(bHX,ry+3,14,bH)){ if(pendingConfirm?.cmd==='owner'&&pendingConfirm?.name===u.name){pendingConfirm=null;doTransferHost(u.name);}else pendingConfirm={cmd:'owner',name:u.name}; return; }
+          if(isHov(bKX,ry+3,14,bH)){doKick(u.name);   pendingConfirm=null;return;}
+          if(isHov(bRX,ry+3,14,bH)){doRemove(u.name); pendingConfirm=null;return;}
+          if(isHov(bBX,ry+3,14,bH)){doBan(u.name);    pendingConfirm=null;return;}
+        }
+        if(g.hasBlocked){
+          const pdnW=22,pdnX=g.panelX+g.panelW-4-pdnW;
+          for(let i=0;i<g.bl.length;i++){
+            const ry=g.blockedBaseY+i*g.rowH;
+            if(isHov(pdnX,ry+3,pdnW,14)){doPardon(g.bl[i].name);return;}
+          }
+        }
+      }
+      return;
+    }
+    onlinePanelOpen=false; pendingConfirm=null;
+  }
+
+  // click on a message to copy it (chat body only, not input row)
+  const chatMY = mouseY - HEADER_H;
+  if(chatMY >= 0 && chatMY < MAXY - PADY*2){
+    for(let i=0; i<history.length; i++){
+      const m = history[i];
+      if(!m || m.type==='_hr' || m.type==='_help') continue;
+      const y = (MAXY-(history.length-1-i)*PADY)-TBOXY+scrollOffset - MARGY;
+      if(chatMY >= y-PADY && chatMY < y+4){
+        const txt = m.type==='whisper'
+          ? '['+m.from+'>'+m.to+']: '+m.message
+          : (m.name ? '<'+m.name+'>: '+m.message : m.message);
+        navigator.clipboard.writeText(txt);
+        return;
+      }
+    }
+  }
+}
+
+// ================================================================
+//  SETUP KEY HANDLER
+// ================================================================
+function handleSetupKey(){
+  if(keyCode===TAB){
+    const vis=setupMode==='profile'?['uname','color']:setupMode==='create'?['rname']:setupMode==='join'?['jroom']:[];
+    if(vis.length) focusField=vis[(vis.indexOf(focusField)+1)%vis.length]; return;
+  }
+  if(keyCode===ENTER){ if(setupMode==='create')doCreateRoom();else if(setupMode==='join')doJoinRoom(); return; }
+  if(keyCode===BACKSPACE){
+    if(focusField==='uname')fUname=fUname.slice(0,-1);
+    else if(focusField==='rname')fRname=fRname.slice(0,-1);
+    else if(focusField==='jroom')fJroom=fJroom.slice(0,-1);
+    else if(focusField==='color')fColor=fColor.slice(0,-1);
+    if(setupMode==='profile')saveProfile(); return;
+  }
+  if(key.length===1){
+    if(focusField==='uname')fUname+=key;
+    else if(focusField==='rname')fRname+=key;
+    else if(focusField==='jroom')fJroom+=key;
+    else if(focusField==='color')fColor+=key;
+    if(setupMode==='profile')saveProfile();
+  }
+}
+
+// ================================================================
+//  NETWORK: CREATE / JOIN / LEAVE / END
+// ================================================================
+function doCreateRoom(){
+  const uname=fUname.trim(), customId=fRname.trim().replace(/\s+/g,'-')||undefined;
+  if(!uname){setStatus('set your username in Profile first',true);setupMode='profile';focusField='uname';return;}
+  username=uname; setStatus('connecting...'); stopPinging();
+  peer=new Peer(customId,{debug:0});
+  peer.on('open',id=>{
+    isHost=true; roomIdStr=id; hostUsername=username;
+    saveCreatedRoom(id,fRname.trim()||id); loadRoles(id);
+    const restored=loadRoomHistory(id);
+    if(!restored){history.length=0;pushMsg({name:'server',message:'Room created.'});}
+    if(!fAvatar) initAvatarDefault();
+    users[username]={color:resolvedColor(id),online:true,avatar:fAvatar,role:'owner'};
+    setupHostListeners();
+    roomBarStr=id+'  |  host  |  '+username; appState='chat';
+  });
+  peer.on('error',e=>{
+    setStatus(e.type==='unavailable-id'?'"'+customId+'" is taken - try another':'error: '+e.type,true);
+    peer.destroy(); peer=null;
+  });
+}
+function doJoinRoom(){
+  const uname=fUname.trim(), roomId=fJroom.trim();
+  if(!uname) {setStatus('set your username in Profile first',true);setupMode='profile';focusField='uname';return;}
+  if(!roomId){setStatus('enter a room id',true);return;}
+  username=uname; setStatus('connecting...'); stopPinging();
+  peer=new Peer(undefined,{debug:0});
+  peer.on('open',myId=>{
+    if(!fAvatar) initAvatarDefault();
+    users[username]={color:resolvedColor(myId),online:true,avatar:fAvatar};
+    const conn=peer.connect(roomId,{reliable:true}); hostConn=conn;
+    conn.on('open',()=>{
+      conn.send({type:'user_info',name:username,color:users[username].color,avatar:fAvatar,version:VERSION});
+      saveJoinedRoom(roomId); roomIdStr=roomId;
+      roomBarStr=roomId+'  |  connected  |  '+username; appState='chat';
+    });
+    conn.on('data',  d=>handleIncoming(d,null));
+    conn.on('close',()=>{ if(appState==='chat') pushMsg({name:'server',message:'disconnected from host.'}); });
+    conn.on('error', e=>setStatus('connection failed: '+e.type,true));
+  });
+  peer.on('error',e=>setStatus('error: '+e.type,true));
+}
+function doLeave(){
+  if(hostConn&&hostConn.open) hostConn.send({type:'user_leave',name:username});
+  if(roomIdStr) saveRoomHistory(roomIdStr);
+  resetToSetup();
+}
+function doEndRoom(){
+  if(roomIdStr) saveRoomHistory(roomIdStr);
+  broadcastToClients({type:'room_end'},null);
+  resetToSetup();
+}
+
+// Native keydown listener — all chat input editing (key repeat + ctrl shortcuts)
+document.addEventListener('keydown', e => {
+  if(appState !== 'chat') return;
+
+  // ctrl shortcuts
+  if(e.ctrlKey || e.metaKey) {
+    if(e.key==='c'){ navigator.clipboard.writeText(working_text); e.preventDefault(); return; }
+    if(e.key==='x'){ undoSnapshot(); navigator.clipboard.writeText(working_text); inputSet('',0); e.preventDefault(); return; }
+    if(e.key==='v'){ undoSnapshot(); navigator.clipboard.readText().then(t=>{ inputInsert(t.replace(/\r?\n/g,' ')); }); e.preventDefault(); return; }
+    if(e.key==='d'){ undoSnapshot(); inputSet('',0); e.preventDefault(); return; }
+    if(e.key==='z'){ e.preventDefault();
+      if(undoStack.length){ redoStack.push({text:working_text,pos:cursorPos}); const s=undoStack.pop(); working_text=s.text; cursorPos=s.pos; undoDirty=false; }
+      return;
+    }
+    if(e.key==='y'){ e.preventDefault();
+      if(redoStack.length){ undoStack.push({text:working_text,pos:cursorPos}); const s=redoStack.pop(); working_text=s.text; cursorPos=s.pos; undoDirty=false; }
+      return;
+    }
+    return; // don't fall through to char insert for other ctrl combos
+  }
+
+  if(e.key==='ArrowLeft') { cursorPos=max(0,cursorPos-1); e.preventDefault(); return; }
+  if(e.key==='ArrowRight'){ cursorPos=min(working_text.length,cursorPos+1); e.preventDefault(); return; }
+  if(e.key==='ArrowUp'){
+    e.preventDefault();
+    if(!consoleHistory.length) return;
+    if(consoleHistIdx===-1) consoleSaved=working_text;
+    consoleHistIdx=min(consoleHistory.length-1, consoleHistIdx+1);
+    inputSet(consoleHistory[consoleHistIdx]);
+    return;
+  }
+  if(e.key==='ArrowDown'){
+    e.preventDefault();
+    if(consoleHistIdx===-1) return;
+    consoleHistIdx--;
+    inputSet(consoleHistIdx===-1 ? consoleSaved : consoleHistory[consoleHistIdx]);
+    return;
+  }
+  if(e.key==='Backspace') { inputBackspace(); e.preventDefault(); return; }
+  if(e.key.length===1)    { inputInsert(e.key); e.preventDefault(); }
+});
+
+
+// ================================================================
+document.getElementById('ri').addEventListener('change',e=>{
+  const file=e.target.files[0]; if(!file) return;
+  const reader=new FileReader();
+  reader.onload=ev=>{
+    try{
+      const data=JSON.parse(ev.target.result);
+      if(Array.isArray(data.history)){history.length=0;data.history.forEach(m=>pushMsg(m));}
+      if(data.users&&typeof data.users==='object')
+        Object.entries(data.users).forEach(([k,v])=>{ if(!users[k]) users[k]=v; });
+    }catch{}
+  };
+  reader.readAsText(file); e.target.value='';
+});
+
+</script>
+</body>
+</html>
