@@ -69,17 +69,8 @@ function doRevokeRole(name){
 // ================================================================
 function sendOrExecModAction(action,target,roleArg){
   if(isHost){
-    if(action==='kick')        doKick(target);
-    else if(action==='remove') doRemove(target);
-    else if(action==='ban')    doBan(target);
-    else if(action==='pardon') doPardon(target);
-    else if(action==='mute')   doMute(target);
-    else if(action==='unmute') doUnmute(target);
-    else if(action==='grant')  doGrantRole(target,roleArg);
-    else if(action==='revoke') doRevokeRole(target);
-  } else if(hostConn&&hostConn.open){
-    hostConn.send({type:'mod_action',action,target,actor:username,roleArg:roleArg||null});
-  }
+    if(action==='kick') doKick(target); else if(action==='remove') doRemove(target); else if(action==='ban') doBan(target); else if(action==='pardon') doPardon(target); else if(action==='mute') doMute(target); else if(action==='unmute') doUnmute(target); else if(action==='grant') doGrantRole(target,roleArg); else if(action==='revoke') doRevokeRole(target);
+  } else if(hostConn&&hostConn.open){ hostConn.send({type:'mod_action',action,target,actor:username,roleArg:roleArg||null}); }
 }
 
 // ================================================================
@@ -95,43 +86,69 @@ function connForName(n){ for(const [c,nm] of clientConnNames) if(nm===n) return 
 function sanitizeAvatar(av){ if(!Array.isArray(av)||av.length!==64) return null; if(av.some(c=>typeof c!=='string'||c.length>32)) return null; return av; }
 
 // ================================================================
-//  LAYOUT  (dynamic — recomputed on resize)
+//  LAYOUT  — everything derived from fontSize/PADY
 // ================================================================
-const MARGX=20, MARGY=20, TBOXY=20;
-const HEADER_H=28, FOOTER_H=36;
-const MBW=74, MBH=28, CBW=88, CBH=26;
-const SFH=28, FB_H=22;
-const SB_W=4;
-const AV_CS=14, AV_PCW=13, AV_PCH=13;
-
 let fontSize=12;
 const FONT_MIN=8, FONT_MAX=24;
-function PADY(){ return fontSize+4; }
 
-let MAXX, MAXY, SFW, SB_X;
+// All layout vars — recomputed in updateLayout()
+let PADY, MARGX, MARGY, TBOXY, SB_W;
+let HEADER_H, FOOTER_H;
+let SFH, SFW, MBW, MBH, CBW, CBH, FB_H;
+let AV_CS, AV_PCW, AV_PCH;
+let MAXX, MAXY, SB_X;
 let SY_TITLE, SY_TAG, SY_UNAME, SY_MBTNS, SY_CONT;
 
 function updateLayout(){
-  MAXX=max(420,windowWidth);
-  MAXY=max(380,windowHeight-HEADER_H-FOOTER_H);
-  SFW=min(440,MAXX-100);
-  SB_X=MAXX-6;
-  SY_TITLE=max(120,floor(MAXY*0.24));
-  SY_TAG=SY_TITLE+24; SY_UNAME=SY_TAG+38; SY_MBTNS=SY_UNAME+SFH+14; SY_CONT=SY_MBTNS+MBH+14;
+  PADY     = fontSize + 4;
+  MARGX    = floor(PADY * 1.25);        // 20 at fs12
+  MARGY    = floor(PADY * 1.25);        // 20
+  TBOXY    = floor(PADY * 1.25);        // 20
+  SB_W     = max(3, floor(PADY * 0.25));// 4
+  HEADER_H = floor(PADY * 1.75);        // 28
+  FOOTER_H = floor(PADY * 2.25);        // 36
+  SFH      = floor(PADY * 1.75);        // 28
+  MBW      = floor(PADY * 4.625);       // 74
+  MBH      = floor(PADY * 1.75);        // 28
+  CBW      = floor(PADY * 5.5);         // 88
+  CBH      = floor(PADY * 1.625);       // 26
+  FB_H     = floor(PADY * 1.375);       // 22
+  AV_CS    = floor(PADY * 0.875);       // 14
+  AV_PCW   = AV_CS - 1;
+  AV_PCH   = AV_CS - 1;
+
+  MAXX = max(420, windowWidth);
+  MAXY = max(380, windowHeight - HEADER_H - FOOTER_H);
+  SFW  = min(440, MAXX - 100);
+  SB_X = MAXX - MARGX/2 - SB_W;
+
+  SY_TITLE = max(floor(PADY*7.5), floor(MAXY*0.24));
+  SY_TAG   = SY_TITLE + floor(PADY*1.5);
+  SY_UNAME = SY_TAG   + floor(PADY*2.375);
+  SY_MBTNS = SY_UNAME + SFH + floor(PADY*0.875);
+  SY_CONT  = SY_MBTNS + MBH + floor(PADY*0.875);
 }
-function avGridPos(){ return {gx:MAXX/2-SFW/2, gy:SY_CONT+SFH+16+SFH+10}; }
+
+function changeFontSize(delta){
+  fontSize = constrain(fontSize+delta, FONT_MIN, FONT_MAX);
+  updateLayout();
+  if(typeof resizeCanvas==='function') resizeCanvas(MAXX, MAXY+HEADER_H+FOOTER_H);
+  avatarGfxCache={};
+}
+
+function avGridPos(){ return {gx:MAXX/2-SFW/2, gy:SY_CONT+SFH+floor(PADY)+SFH+floor(PADY*0.625)}; }
 
 // ================================================================
 //  ONLINE PANEL GEOMETRY
 // ================================================================
 function getBlockedList(){ if(!isHost) return []; const all=new Set([...removedNames,...permanentBans]); return [...all].map(n=>({name:n,type:permanentBans.has(n)?'ban':'remove'})); }
 function onlinePanelGeom(ol,fy){
-  const bl=getBlockedList(), hasBlocked=bl.length>0, panelW=isHost?296:175;
-  const rowH=20, padX=10, padY=8;
-  const blockedOffset=hasBlocked?ol.length*rowH+(ol.length>0?10:0):0;
+  const bl=getBlockedList(), hasBlocked=bl.length>0, panelW=isHost?floor(PADY*18.5):floor(PADY*10.9);
+  const rowH=floor(PADY*1.25), padX=floor(PADY*0.625), padY=floor(PADY*0.5);
+  const blockedOffset=hasBlocked?ol.length*rowH+(ol.length>0?floor(PADY*0.625):0):0;
   const innerH=hasBlocked?blockedOffset+bl.length*rowH:ol.length*rowH;
-  const panelH=padY+innerH+padY-4;
-  const panelX=MAXX-MARGX-panelW, panelY=fy-panelH-5;
+  const panelH=padY+innerH+padY-floor(PADY*0.25);
+  const panelX=MAXX-MARGX-panelW, panelY=fy-panelH-floor(PADY*0.3125);
   const blockedBaseY=hasBlocked?panelY+padY+blockedOffset:0;
   return {panelW,rowH,padX,padY,panelH,panelX,panelY,bl,hasBlocked,blockedBaseY};
 }
@@ -140,18 +157,13 @@ function onlinePanelGeom(ol,fy){
 //  COMPLETE JOIN
 // ================================================================
 function _completeJoin(fromConn,name,color,avatar,role){
-  if(persistentOps.has(name)||persistentMods.has(name)){
-    _silentClearRole(name); saveRoles(roomIdStr);
-    pushMsg({name:'server',message:'note: '+name+' had a saved role but it was cleared on rejoin — re-grant if trusted'});
-  }
+  if(persistentOps.has(name)||persistentMods.has(name)){ _silentClearRole(name); saveRoles(roomIdStr); pushMsg({name:'server',message:'note: '+name+' had a saved role but it was cleared on rejoin — re-grant if trusted'}); }
   users[name]={color,online:true,avatar,role:_deriveRole(name)};
   invalidateAvatarCache(name);
   clientConnNames.set(fromConn,name);
   const jm=name+' joined';
   pushMsg({name:'server',message:jm});
-  fromConn.send({type:'init',version:VERSION,
-    history:JSON.parse(JSON.stringify(history.filter(m=>m.type!=='_hr'&&m.type!=='_help'))),
-    users:  JSON.parse(JSON.stringify(users)),hostName:username});
+  fromConn.send({type:'init',version:VERSION,history:JSON.parse(JSON.stringify(history.filter(m=>m.type!=='_hr'&&m.type!=='_help'))),users:JSON.parse(JSON.stringify(users)),hostName:username});
   broadcastToClients({type:'user_info',name,color,avatar,role:_deriveRole(name)},fromConn);
   broadcastToClients({type:'message',name:'server',message:jm},fromConn);
   if(!roomPasswords[name]) fromConn.send({type:'suggest_register'});
@@ -188,7 +200,7 @@ function handleIncoming(data,fromConn){
   } else if(data.type==='auth_fail'){        pushMsg({name:'server',message:'wrong password — '+data.attemptsLeft+' attempt'+(data.attemptsLeft===1?'':'s')+' remaining'});
   } else if(data.type==='suggest_register'){ pushMsg({name:'server',message:'tip: use /register <password> to protect your username'});
   } else if(data.type==='register'){ if(!isHost) return; const sn=clientConnNames.get(fromConn); if(!sn) return; roomPasswords[sn]=data.hash; savePasswords(roomIdStr); fromConn.send({type:'register_ack'});
-  } else if(data.type==='register_ack'){     pushMsg({name:'server',message:'password registered'});
+  } else if(data.type==='register_ack'){ pushMsg({name:'server',message:'password registered'});
 
   } else if(data.type==='user_leave'){
     if(isHost){ const sn=clientConnNames.get(fromConn); if(sn!==data.name) return; }
@@ -317,11 +329,11 @@ function doEditLast(name,newText){ for(let i=history.length-1;i>=0;i--){ const m
 //  HISTORY / SCROLL
 // ================================================================
 const HISTORY_LIMIT=200;
-function pushMsg(msg){ if(!msg.ts) msg.ts=Date.now(); const atBottom=scrollOffset===0; history.push(msg); if(history.length>HISTORY_LIMIT) history.splice(0,history.length-HISTORY_LIMIT);     if(!atBottom){ scrollOffset+=PADY(); clampScroll(); } }
+function pushMsg(msg){ if(!msg.ts) msg.ts=Date.now(); const atBottom=scrollOffset===0; history.push(msg); if(history.length>HISTORY_LIMIT) history.splice(0,history.length-HISTORY_LIMIT); if(!atBottom){ scrollOffset+=PADY; clampScroll(); } }
 
 let scrollOffset=0, linkRegions=[];
-function chatAreaH(){ return MAXY-TBOXY-PADY(); }
-function getMaxScroll(){ return max(0,history.length*PADY()-chatAreaH()); }
+function chatAreaH(){ return MAXY-TBOXY-PADY; }
+function getMaxScroll(){ return max(0,history.length*PADY-chatAreaH()); }
 function clampScroll(){ scrollOffset=constrain(scrollOffset,0,getMaxScroll()); }
 function mouseWheel(event){ if(appState!=='chat') return; scrollOffset=constrain(scrollOffset-event.delta,0,getMaxScroll()); return false; }
 
@@ -367,17 +379,11 @@ let fUname='', fRname='', fJroom='', fColor='';
 let statusTxt='', statusType='n';
 let roomIdStr='', copyLabel='copy ID', roomBarStr='';
 let onlinePanelOpen=false;
-
-// Setup field undo (single-level per field)
-let setupUndo={uname:'', rname:'', jroom:'', color:''};
-let setupRedo={uname:'', rname:'', jroom:'', color:''};
+let setupUndo={uname:'',rname:'',jroom:'',color:''};
+let setupRedo={uname:'',rname:'',jroom:'',color:''};
 
 function getSetupField(f){ return {uname:fUname,rname:fRname,jroom:fJroom,color:fColor}[f||focusField]||''; }
-function setSetupField(v,f){
-  const k=f||focusField;
-  if(k==='uname') fUname=v; else if(k==='rname') fRname=v; else if(k==='jroom') fJroom=v; else if(k==='color') fColor=v;
-  if(setupMode==='profile') saveProfile();
-}
+function setSetupField(v,f){ const k=f||focusField; if(k==='uname')fUname=v;else if(k==='rname')fRname=v;else if(k==='jroom')fJroom=v;else if(k==='color')fColor=v; if(setupMode==='profile')saveProfile(); }
 
 function setStatus(msg,isErr,isOk){ statusTxt=msg; statusType=isErr?'e':isOk?'o':'n'; }
 function resetToSetup(){
@@ -413,7 +419,7 @@ function drawSegments(segs,x,by,msgCol){
   textSize(fontSize); textAlign(LEFT,BASELINE);
   for(const s of segs){
     const w=textWidth(s.text);
-    if(s.isUrl){ fill(color(90,160,230)); text(s.text,x,by); stroke(color(90,160,230)); strokeWeight(0.5); line(x,by+1,x+w,by+1); noStroke();     linkRegions.push({url:s.text,x,y:by-PADY()+3,w,h:PADY()}); }
+    if(s.isUrl){ fill(color(90,160,230)); text(s.text,x,by); stroke(color(90,160,230)); strokeWeight(0.5); line(x,by+1,x+w,by+1); noStroke(); linkRegions.push({url:s.text,x,y:by-PADY+3,w,h:PADY}); }
     else        { fill(msgCol); text(s.text,x,by); }
     x+=w;
   }
@@ -454,14 +460,7 @@ function windowResized(){ updateLayout(); resizeCanvas(MAXX,MAXY+HEADER_H+FOOTER
 
 function keyPressed(){
   if(appState==='setup') handleSetupKey();
-  else{
-    if(keyCode==ENTER){
-      undoSnapshot();
-      if(working_text.trim()){ consoleHistory.unshift(working_text); if(consoleHistory.length>200) consoleHistory.pop(); }
-      consoleHistIdx=-1; consoleSaved='';
-      handleCommand(working_text); working_text=''; cursorPos=0; undoStack=[]; redoStack=[];
-    }
-  }
+  else{ if(keyCode==ENTER){ undoSnapshot(); if(working_text.trim()){ consoleHistory.unshift(working_text); if(consoleHistory.length>200) consoleHistory.pop(); } consoleHistIdx=-1; consoleSaved=''; handleCommand(working_text); working_text=''; cursorPos=0; undoStack=[]; redoStack=[]; } }
   return false;
 }
 function mouseDragged(){ if(appState!=='setup'||setupMode!=='profile') return; const {gx,gy}=avGridPos(); if(isHov(gx,gy,8*AV_CS,8*AV_CS)){ if(!fAvatar) initAvatarDefault(); paintAvatarCell(mouseX,mouseY,gx,gy); } }
@@ -475,13 +474,13 @@ function drawInput(){
   const lines=[]; let rem=working_text;
   while(rem.length>lineLen){ lines.push(rem.slice(0,lineLen)); rem=rem.slice(lineLen); }
   lines.push(rem);
-  const baseY=(MAXY+1.5*PADY())-TBOXY;
+  const baseY=(MAXY+1.5*PADY)-TBOXY;
   noStroke(); textAlign(LEFT,BASELINE);
-  if(authPending){ noStroke(); fill(color(80,55,20,60)); rect(0,baseY-PADY(),MAXX,PADY()+4); if(!working_text){ fill(color(160,120,50)); textSize(fontSize); textAlign(LEFT,BASELINE); text('/login <password>',MARGX,baseY-MARGY); return; } }
+  if(authPending){ noStroke(); fill(color(80,55,20,60)); rect(0,baseY-PADY,MAXX,PADY+4); if(!working_text){ fill(color(160,120,50)); textSize(fontSize); textAlign(LEFT,BASELINE); text('/login <password>',MARGX,baseY-MARGY); return; } }
   for(let i=0;i<lines.length;i++){
-    const y=baseY-(lines.length-1-i)*PADY()-MARGY, start=i*lineLen, end=start+lines[i].length;
+    const y=baseY-(lines.length-1-i)*PADY-MARGY, start=i*lineLen, end=start+lines[i].length;
     fill(200); text(lines[i],MARGX,y);
-    if(cursorPos>=start&&cursorPos<=end){ const cx=MARGX+textWidth(lines[i].slice(0,cursorPos-start)); if(blink){ fill(200); text('|',cx,y); } else { stroke(80); strokeWeight(1); line(cx,y,cx,y-PADY()+3); noStroke(); } }
+    if(cursorPos>=start&&cursorPos<=end){ const cx=MARGX+textWidth(lines[i].slice(0,cursorPos-start)); if(blink){ fill(200); text('|',cx,y); } else { stroke(80); strokeWeight(1); line(cx,y,cx,y-PADY+3); noStroke(); } }
   }
 }
 
@@ -494,13 +493,13 @@ function draw(){
     drawHeader(); drawFooter();
     push(); translate(0,HEADER_H);
     drawingContext.save(); drawingContext.beginPath(); drawingContext.rect(0,0,MAXX,MAXY); drawingContext.clip();
-    for(let i=0;i<history.length;i++){ const y=(MAXY-(history.length-1-i)*PADY())-TBOXY+scrollOffset; if(y-MARGY>MAXY+2||y-MARGY<-PADY()) continue; renderText(history[i],y); }
+    for(let i=0;i<history.length;i++){ const y=(MAXY-(history.length-1-i)*PADY)-TBOXY+scrollOffset; if(y-MARGY>MAXY+2||y-MARGY<-PADY) continue; renderText(history[i],y); }
     drawingContext.restore();
     for(const r of linkRegions){ if(mouseX>=r.x&&mouseX<=r.x+r.w&&mouseY-HEADER_H>=r.y&&mouseY-HEADER_H<=r.y+r.h){ cursor(HAND); break; } }
     drawInput();
     const maxS=getMaxScroll();
     if(maxS>0){ const areaH=MAXY-10, thumbH=max(20,areaH*(MAXY/(MAXY+maxS))); const thumbT=5+(1-scrollOffset/maxS)*(areaH-thumbH); noStroke(); fill(38); rect(SB_X,5,SB_W,areaH,2); fill(scrollOffset>0?95:55); rect(SB_X,thumbT,SB_W,thumbH,2); }
-    if(scrollOffset>0){ const bW=58,bH=16,bX=MAXX/2-bW/2,bY=MAXY-TBOXY-bH-6; const hov=mouseX>=bX&&mouseX<=bX+bW&&mouseY-HEADER_H>=bY&&mouseY-HEADER_H<=bY+bH; if(hov) cursor(HAND); strokeWeight(1); stroke(hov?100:65); fill(hov?color(55,58,68):color(35,38,45)); rect(bX,bY,bW,bH,3); noStroke(); fill(hov?190:120); textSize(10); textAlign(CENTER,CENTER); text('↓  latest',bX+bW/2,bY+bH/2); }
+    if(scrollOffset>0){ const bW=floor(PADY*3.625),bH=floor(PADY),bX=MAXX/2-bW/2,bY=MAXY-TBOXY-bH-6; const hov=mouseX>=bX&&mouseX<=bX+bW&&mouseY-HEADER_H>=bY&&mouseY-HEADER_H<=bY+bH; if(hov) cursor(HAND); strokeWeight(1); stroke(hov?100:65); fill(hov?color(55,58,68):color(35,38,45)); rect(bX,bY,bW,bH,3); noStroke(); fill(hov?190:120); textSize(max(9,fontSize-2)); textAlign(CENTER,CENTER); text('↓  latest',bX+bW/2,bY+bH/2); }
     pop();
   }
   if(appState==='setup') drawSetup();
@@ -543,18 +542,18 @@ function handleCommand(text){
 
   if(cmd==='login'){ pushMsg({name:'server',message:'already authenticated'});
   } else if(cmd==='register'){ const pw=parts.slice(1).join(' '); if(!pw){ pushMsg({name:'server',message:'usage: /register <password>'}); return; } hashPassword(pw).then(hash=>{ if(isHost){ roomPasswords[username]=hash; savePasswords(roomIdStr); pushMsg({name:'server',message:'password registered'}); } else if(hostConn&&hostConn.open) hostConn.send({type:'register',hash}); });
-  } else if(cmd==='mu'||cmd==='mute'){ if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('mute',t);
+  } else if(cmd==='mu'||cmd==='mute'){  if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('mute',t);
   } else if(cmd==='um'||cmd==='unmute'){ if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; sendOrExecModAction('unmute',t);
-  } else if(cmd==='k'||cmd==='kick'){ if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('kick',t);
+  } else if(cmd==='k'||cmd==='kick'){   if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('kick',t);
   } else if(cmd==='r'||cmd==='rem'||cmd==='remove'){ if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('remove',t);
-  } else if(cmd==='b'||cmd==='ban'){ if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('ban',t);
+  } else if(cmd==='b'||cmd==='ban'){    if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('ban',t);
   } else if(cmd==='p'||cmd==='pdn'||cmd==='pardon'){ if(!needRank(3,'operator'))return; if(!arg1){pushMsg({name:'server',message:'usage: /pardon <n>'});return;} sendOrExecModAction('pardon',arg1);
   } else if(cmd==='tm'||cmd==='tempmod'){ if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'tempmod'));
-  } else if(cmd==='m'||cmd==='mod'){ if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'mod'));
+  } else if(cmd==='m'||cmd==='mod'){    if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'mod'));
   } else if(cmd==='dm'||cmd==='demod'){ if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return; if(userRank(t)!==2){pushMsg({name:'server',message:arg1+' is not a moderator'});return;} confirmOrExecute(cmd,t,()=>sendOrExecModAction('revoke',t,'mod'));
   } else if(cmd==='to'||cmd==='tempop'){ if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'tempop'));
-  } else if(cmd==='o'||cmd==='op'){ if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'op'));
-  } else if(cmd==='do'||cmd==='deop'){ if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return; if(userRank(t)!==3){pushMsg({name:'server',message:arg1+' is not an operator'});return;} confirmOrExecute(cmd,t,()=>sendOrExecModAction('revoke',t,'op'));
+  } else if(cmd==='o'||cmd==='op'){     if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'op'));
+  } else if(cmd==='do'||cmd==='deop'){  if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return; if(userRank(t)!==3){pushMsg({name:'server',message:arg1+' is not an operator'});return;} confirmOrExecute(cmd,t,()=>sendOrExecModAction('revoke',t,'op'));
   } else if(cmd==='owner'){ if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return; confirmOrExecute(cmd,t,()=>doTransferHost(t));
   } else if(cmd==='w'||cmd==='whisper'){ const t=resolveTarget(arg1);if(!t)return; if(!rest){pushMsg({name:'server',message:'usage: /w <n> <message>'});return;} doWhisper(t,rest);
   } else if(cmd==='q'||cmd==='quit'||cmd==='exit'){ rank>=4?doEndRoom():doLeave();
@@ -577,11 +576,11 @@ function handleCommand(text){
 //  P5 UI PRIMITIVES
 // ================================================================
 function isHov(x,y,w,h){ return mouseX>=x&&mouseX<=x+w&&mouseY>=y&&mouseY<=y+h; }
-function uiBtn(label,x,y,w,h,active){ const hov=isHov(x,y,w,h); if(hov)cursor(HAND); strokeWeight(1); stroke(active?color(115,182,115):(hov?125:72)); fill(active?42:(hov?68:50)); rect(x,y,w,h,2); noStroke(); fill(active?color(115,182,115):(hov?228:148)); textSize(11); textAlign(CENTER,CENTER); text(label,x+w/2,y+h/2); return hov; }
-function uiField(val,x,y,w,h,ph,focused){ const cur=focused&&Math.floor(frame/30)%2===1?'|':''; strokeWeight(1); stroke(focused?108:58); fill(focused?40:28); rect(x,y,w,h,2); noStroke(); textSize(12); textAlign(LEFT,CENTER); if(val.length>0){fill(210);text(val+cur,x+8,y+h/2);}else{fill(62);text(ph+cur,x+8,y+h/2);} }
-function uiFieldLocked(val,x,y,w,h){ strokeWeight(1); stroke(38); fill(20); rect(x,y,w,h,2); noStroke(); textSize(12); textAlign(LEFT,CENTER); if(val.length>0){fill(85);text(val,x+8,y+h/2);}else{fill(50);text('no username set',x+8,y+h/2);} textAlign(RIGHT,CENTER); fill(45); textSize(10); text('[set in Profile]',x+w-6,y+h/2); }
-function uiLabel(txt,x,y){ noStroke(); fill(85); textSize(9); textAlign(LEFT,CENTER); text(txt,x,y); }
-function _tintBtn(label,x,y,w,h,rc,gc,bc,lightText){ const hov=isHov(x,y,w,h); if(hov)cursor(HAND); strokeWeight(1); stroke(hov?color(rc,gc,bc):color(rc*.54,gc*.54,bc*.54)); fill(hov?color(rc*.30,gc*.30,bc*.30):color(rc*.15,gc*.15,bc*.15)); rect(x,y,w,h,2); noStroke(); if(lightText) fill(hov?color(210,210,215):color(130,130,140)); else fill(hov?color(rc,gc,bc):color(rc*.60,gc*.60,bc*.60)); textSize(9); textAlign(CENTER,CENTER); text(label,x+w/2,y+h/2); return hov; }
+function uiBtn(label,x,y,w,h,active){ const hov=isHov(x,y,w,h); if(hov)cursor(HAND); strokeWeight(1); stroke(active?color(115,182,115):(hov?125:72)); fill(active?42:(hov?68:50)); rect(x,y,w,h,2); noStroke(); fill(active?color(115,182,115):(hov?228:148)); textSize(max(9,fontSize-1)); textAlign(CENTER,CENTER); text(label,x+w/2,y+h/2); return hov; }
+function uiField(val,x,y,w,h,ph,focused){ const cur=focused&&Math.floor(frame/30)%2===1?'|':''; strokeWeight(1); stroke(focused?108:58); fill(focused?40:28); rect(x,y,w,h,2); noStroke(); textSize(fontSize); textAlign(LEFT,CENTER); if(val.length>0){fill(210);text(val+cur,x+8,y+h/2);}else{fill(62);text(ph+cur,x+8,y+h/2);} }
+function uiFieldLocked(val,x,y,w,h){ strokeWeight(1); stroke(38); fill(20); rect(x,y,w,h,2); noStroke(); textSize(fontSize); textAlign(LEFT,CENTER); if(val.length>0){fill(85);text(val,x+8,y+h/2);}else{fill(50);text('no username set',x+8,y+h/2);} textAlign(RIGHT,CENTER); fill(45); textSize(max(8,fontSize-2)); text('[set in Profile]',x+w-6,y+h/2); }
+function uiLabel(txt,x,y){ noStroke(); fill(85); textSize(max(8,fontSize-3)); textAlign(LEFT,CENTER); text(txt,x,y); }
+function _tintBtn(label,x,y,w,h,rc,gc,bc,lightText){ const hov=isHov(x,y,w,h); if(hov)cursor(HAND); strokeWeight(1); stroke(hov?color(rc,gc,bc):color(rc*.54,gc*.54,bc*.54)); fill(hov?color(rc*.30,gc*.30,bc*.30):color(rc*.15,gc*.15,bc*.15)); rect(x,y,w,h,2); noStroke(); if(lightText) fill(hov?color(210,210,215):color(130,130,140)); else fill(hov?color(rc,gc,bc):color(rc*.60,gc*.60,bc*.60)); textSize(max(8,fontSize-3)); textAlign(CENTER,CENTER); text(label,x+w/2,y+h/2); return hov; }
 const uiKickBtn   = (l,x,y,w,h)      => _tintBtn(l,x,y,w,h,210,165, 55,false);
 const uiRemoveBtn = (l,x,y,w,h)      => _tintBtn(l,x,y,w,h,210, 70, 70,false);
 const uiBanBtn    = (l,x,y,w,h)      => _tintBtn(l,x,y,w,h, 55, 55, 68,true);
@@ -597,11 +596,11 @@ function uiClearBtn(x,y,w,h){ return _tintBtn('[clr]',x,y,w,h,190,110,40,false);
 // ================================================================
 function drawAvatarEditor(fx,cy){
   if(!fAvatar) initAvatarDefault();
-  uiLabel('avatar  (left-click paint  |  right-click erase)',fx,cy-7);
+  uiLabel('avatar  (left-click paint  |  right-click erase)',fx,cy-floor(PADY*0.4375));
   for(let r=0;r<8;r++) for(let c=0;c<8;c++){ const i=r*8+c, x=fx+c*AV_CS, y=cy+r*AV_CS; strokeWeight(0.5); stroke(35); fill(fAvatar[i]||25); rect(x,y,AV_CS,AV_CS); }
   const {gx,gy}=avGridPos();
   if(isHov(gx,gy,8*AV_CS,8*AV_CS)){ const c=floor((mouseX-gx)/AV_CS), r=floor((mouseY-gy)/AV_CS); if(c>=0&&c<8&&r>=0&&r<8){ cursor(CROSS); noFill(); stroke(180,180,180,120); strokeWeight(1); rect(gx+c*AV_CS,gy+r*AV_CS,AV_CS,AV_CS); } }
-  const px=fx+8*AV_CS+5;
+  const px=fx+8*AV_CS+floor(PADY*0.3125);
   for(let i=0;i<AV_PALETTE.length;i++){
     const pr=floor(i/2), pc=i%2, bx=px+pc*(AV_PCW+2), by=cy+pr*(AV_PCH+2), sel=i===avPalIdx;
     if(isHov(bx,by,AV_PCW,AV_PCH)) cursor(HAND);
@@ -609,29 +608,32 @@ function drawAvatarEditor(fx,cy){
     if(pval==='ERASE'){ strokeWeight(sel?2:0.5); stroke(sel?220:55); fill(18); rect(bx,by,AV_PCW,AV_PCH,1); noStroke(); fill(45); rect(bx,by,AV_PCW/2,AV_PCH/2); rect(bx+AV_PCW/2,by+AV_PCH/2,AV_PCW/2,AV_PCH/2); fill(130); textSize(8); textAlign(CENTER,CENTER); text('×',bx+AV_PCW/2,by+AV_PCH/2+1); }
     else { const col=pval===null?resolvedColor('preview'):pval; strokeWeight(sel?2:0.5); stroke(sel?220:55); fill(col); rect(bx,by,AV_PCW,AV_PCH,1); }
   }
-  const btnY=cy+8*AV_CS+6; uiBtn('fill all',fx,btnY,53,18); uiBtn('clear',fx+57,btnY,53,18);
+  const btnH=floor(SFH*0.65), btnY=cy+8*AV_CS+floor(PADY*0.375);
+  uiBtn('fill all',fx,btnY,floor(CBW*0.6),btnH);
+  uiBtn('clear',fx+floor(CBW*0.6)+4,btnY,floor(CBW*0.6),btnH);
 }
 
 // ================================================================
 //  ROOM LIST
 // ================================================================
-function roomListLayout(mode,startCy){ const rooms=mode==='create'?loadCreatedRooms():loadJoinedRooms(); if(!rooms.length) return null; const fx=MAXX/2-SFW/2, labelY=startCy+8; return {labelY, rows:rooms.map((r,i)=>({room:r,y:labelY+14+i*22})), fx}; }
+function roomListLayout(mode,startCy){ const rooms=mode==='create'?loadCreatedRooms():loadJoinedRooms(); if(!rooms.length) return null; const fx=MAXX/2-SFW/2, labelY=startCy+floor(PADY*0.5); return {labelY, rows:rooms.map((r,i)=>({room:r,y:labelY+floor(PADY*0.875)+i*floor(PADY*1.375)})), fx}; }
 function drawRoomList(mode,startCy){
   const layout=roomListLayout(mode,startCy); if(!layout) return;
   const {labelY,rows,fx}=layout;
-  noStroke(); fill(55); textSize(9); textAlign(LEFT,CENTER); text(mode==='create'?'YOUR ROOMS':'KNOWN ROOMS',fx,labelY);
+  const rowH=floor(PADY*1.25);
+  noStroke(); fill(55); textSize(max(8,fontSize-3)); textAlign(LEFT,CENTER); text(mode==='create'?'YOUR ROOMS':'KNOWN ROOMS',fx,labelY);
   for(const {room,y} of rows){
-    const st=roomStatuses[room.id]||'checking', hov=isHov(fx,y,SFW,20);
-    const delX=fx+SFW-18, delHov=isHov(delX,y+3,14,14);
+    const st=roomStatuses[room.id]||'checking', hov=isHov(fx,y,SFW,rowH);
+    const delX=fx+SFW-rowH, delHov=isHov(delX,y+floor(rowH*0.2),rowH-4,rowH-4);
     if(hov&&!delHov) cursor(HAND);
-    strokeWeight(1); stroke(hov?72:42); fill(hov?38:28); rect(fx,y,SFW,20,2); noStroke();
-    fill(st==='online'?color(78,160,78):st==='offline'?color(140,58,58):color(155,140,45)); ellipse(fx+12,y+10,7,7);
-    fill(hov&&!delHov?210:148); textSize(10); textAlign(LEFT,CENTER);
+    strokeWeight(1); stroke(hov?72:42); fill(hov?38:28); rect(fx,y,SFW,rowH,2); noStroke();
+    fill(st==='online'?color(78,160,78):st==='offline'?color(140,58,58):color(155,140,45)); ellipse(fx+floor(rowH*0.6),y+rowH/2,floor(rowH*0.45),floor(rowH*0.45));
+    fill(hov&&!delHov?210:148); textSize(max(9,fontSize-2)); textAlign(LEFT,CENTER);
     const lbl=room.rname&&room.rname!==room.id?room.rname:room.id;
-    text(lbl.length>34?lbl.slice(0,32)+'..':lbl,fx+22,y+10);
+    text(lbl.length>34?lbl.slice(0,32)+'..':lbl,fx+floor(rowH*1.2),y+rowH/2);
     if(delHov) cursor(HAND);
-    strokeWeight(1); stroke(delHov?color(200,80,80):color(90,40,40)); fill(delHov?color(80,20,20):color(35,15,15)); rect(delX,y+3,14,14,2);
-    noStroke(); fill(delHov?color(230,110,110):color(140,60,60)); textSize(11); textAlign(CENTER,CENTER); text('×',delX+7,y+10);
+    strokeWeight(1); stroke(delHov?color(200,80,80):color(90,40,40)); fill(delHov?color(80,20,20):color(35,15,15)); rect(delX,y+floor(rowH*0.2),rowH-4,rowH-4,2);
+    noStroke(); fill(delHov?color(230,110,110):color(140,60,60)); textSize(fontSize); textAlign(CENTER,CENTER); text('×',delX+(rowH-4)/2,y+rowH/2);
   }
 }
 
@@ -641,66 +643,63 @@ function drawRoomList(mode,startCy){
 function drawSetup(){
   noStroke(); fill(0,0,0,215); rect(0,0,MAXX,height);
   const cx=MAXX/2, fx=cx-SFW/2;
-  noStroke(); fill(115,182,115); textSize(21); textAlign(CENTER,CENTER); text('p2p chat',cx,SY_TITLE);
-  fill(72); textSize(9); text('P E E R  *  T O  *  P E E R  *  D I R E C T',cx,SY_TAG);
+  noStroke(); fill(115,182,115); textSize(floor(PADY*1.3)); textAlign(CENTER,CENTER); text('p2p chat',cx,SY_TITLE);
+  fill(72); textSize(max(8,floor(PADY*0.5625))); text('P E E R  *  T O  *  P E E R  *  D I R E C T',cx,SY_TAG);
   if(setupMode!=='profile') uiFieldLocked(fUname,fx,SY_UNAME,SFW,SFH);
-  const mb1x=cx-117, mb2x=cx-37, mb3x=cx+43;
+  const mb1x=cx-floor(MBW*1.5)-5, mb2x=cx-floor(MBW/2), mb3x=cx+floor(MBW/2)+5;
   uiBtn('Create Room',mb1x,SY_MBTNS,MBW,MBH,setupMode==='create');
   uiBtn('Join Room',  mb2x,SY_MBTNS,MBW,MBH,setupMode==='join');
   uiBtn('Profile',    mb3x,SY_MBTNS,MBW,MBH,setupMode==='profile');
   let cy=SY_CONT;
-  if(setupMode==='create'){ uiField(fRname,fx,cy,SFW,SFH,'room name (optional)',focusField==='rname'); cy+=SFH+10; uiBtn('Create',cx-CBW/2,cy,CBW,CBH); cy+=CBH+12; drawRoomList('create',cy); }
-  if(setupMode==='join'){   uiField(fJroom,fx,cy,SFW,SFH,'room id',focusField==='jroom'); cy+=SFH+10; uiBtn('Connect',cx-CBW/2,cy,CBW,CBH); cy+=CBH+12; drawRoomList('join',cy); }
+  if(setupMode==='create'){ uiField(fRname,fx,cy,SFW,SFH,'room name (optional)',focusField==='rname'); cy+=SFH+floor(PADY*0.625); uiBtn('Create',cx-CBW/2,cy,CBW,CBH); cy+=CBH+floor(PADY*0.75); drawRoomList('create',cy); }
+  if(setupMode==='join'){   uiField(fJroom,fx,cy,SFW,SFH,'room id',focusField==='jroom'); cy+=SFH+floor(PADY*0.625); uiBtn('Connect',cx-CBW/2,cy,CBW,CBH); cy+=CBH+floor(PADY*0.75); drawRoomList('join',cy); }
   if(setupMode==='profile'){
-    uiLabel('username',fx,cy-7); uiField(fUname,fx,cy,SFW,SFH,'username',focusField==='uname'); cy+=SFH+16;
-    uiLabel('color  (hex, hsl, or css name -- leave empty for auto)',fx,cy-7);
+    uiLabel('username',fx,cy-floor(PADY*0.4375)); uiField(fUname,fx,cy,SFW,SFH,'username',focusField==='uname'); cy+=SFH+PADY;
+    uiLabel('color  (hex, hsl, or css name -- leave empty for auto)',fx,cy-floor(PADY*0.4375));
     const cfw=SFW-SFH-8; uiField(fColor,fx,cy,cfw,SFH,'auto',focusField==='color');
-    strokeWeight(1); stroke(72); try{ fill(fColor.trim()?color(fColor.trim()):color(colorFromId('preview'))); }catch(e){ fill(60); } rect(fx+cfw+8,cy,SFH,SFH,2); cy+=SFH+10;
-    drawAvatarEditor(fx,cy); cy+=8*AV_CS+6+18+8;
+    strokeWeight(1); stroke(72); try{ fill(fColor.trim()?color(fColor.trim()):color(colorFromId('preview'))); }catch(e){ fill(60); } rect(fx+cfw+8,cy,SFH,SFH,2); cy+=SFH+floor(PADY*0.625);
+    drawAvatarEditor(fx,cy); cy+=8*AV_CS+floor(PADY*0.375)+floor(SFH*0.65)+floor(PADY*0.5);
   }
-  noStroke(); fill(statusType==='e'?color(185,85,85):statusType==='o'?color(95,165,95):color(95)); textSize(11); textAlign(CENTER,CENTER); text(statusTxt,cx,cy);
+  noStroke(); fill(statusType==='e'?color(185,85,85):statusType==='o'?color(95,165,95):color(95)); textSize(max(9,fontSize-1)); textAlign(CENTER,CENTER); text(statusTxt,cx,cy);
 }
 
 // ================================================================
 //  CHAT HEADER & FOOTER
 // ================================================================
-// Font-size button layout (right side of header, always visible in chat)
 function fontBtnLayout(){
-  const hy=(HEADER_H-16)/2, bw=20, gap=2, numW=22;
+  const hy=(HEADER_H-floor(PADY))/2, bw=floor(PADY*1.375), numW=floor(PADY*1.375), gap=2;
   const x_plus  = MAXX-MARGX-bw;
   const x_num   = x_plus-gap-numW;
   const x_minus = x_num-gap-bw;
-  const x_copy  = x_minus-6-52; // host copy button, further left
-  return {hy, bw, numW, gap, x_plus, x_num, x_minus, x_copy};
+  const x_copy  = x_minus-MARGX-floor(PADY*3.25);
+  return {hy, bw, numW, gap, x_plus, x_num, x_minus, x_copy, h:floor(PADY)};
 }
-
 function drawHeader(){
   noStroke(); fill(32); rect(0,0,MAXX,HEADER_H);
   stroke(55); strokeWeight(1); line(0,HEADER_H,MAXX,HEADER_H); noStroke();
-  fill(roomBarStr?148:60); textSize(11); textAlign(LEFT,CENTER);
+  fill(roomBarStr?148:60); textSize(max(9,fontSize-1)); textAlign(LEFT,CENTER);
   text(roomBarStr||'not connected',MARGX,HEADER_H/2);
   if(appState==='chat'){
-    const {hy,bw,numW,gap,x_plus,x_num,x_minus,x_copy}=fontBtnLayout();
-    uiBtn('A+',x_plus, hy,bw,16);
-    noStroke(); fill(90); textSize(10); textAlign(CENTER,CENTER); text(fontSize,x_num+numW/2,hy+8);
-    uiBtn('A-',x_minus,hy,bw,16);
-    if(isHost&&roomIdStr) uiBtn(copyLabel,x_copy,hy,52,16);
+    const {hy,bw,numW,gap,x_plus,x_num,x_minus,x_copy,h}=fontBtnLayout();
+    uiBtn('A+',x_plus, hy,bw,h);
+    noStroke(); fill(90); textSize(max(8,fontSize-3)); textAlign(CENTER,CENTER); text(fontSize,x_num+numW/2,hy+h/2);
+    uiBtn('A-',x_minus,hy,bw,h);
+    if(isHost&&roomIdStr) uiBtn(copyLabel,x_copy,hy,floor(PADY*3.25),h);
   }
 }
-
 function getOnlineList(){ return Object.entries(users).filter(([k,v])=>k!=='server'&&v.online).map(([k,v])=>({name:k,color:v.color})); }
-function footerBtns(){ if(isHost) return [{id:'bk',label:'[bk]',x:20,w:46},{id:'rs',label:'[rs]',x:70,w:46},{id:'clr',label:'[clr]',x:120,w:42,tint:true},{id:'end',label:'[end room]',x:166,w:82}]; return [{id:'leave',label:'[leave]',x:20,w:72}]; }
+function footerBtns(){ if(isHost) return [{id:'bk',label:'[bk]',x:MARGX,w:floor(PADY*2.875)},{id:'rs',label:'[rs]',x:MARGX+floor(PADY*2.875)+floor(PADY*0.5),w:floor(PADY*2.875)},{id:'clr',label:'[clr]',x:MARGX+floor(PADY*2.875)*2+PADY,w:floor(PADY*2.625),tint:true},{id:'end',label:'[end room]',x:MARGX+floor(PADY*2.875)*2+floor(PADY*3.625)+floor(PADY*0.5),w:floor(PADY*5.125)}]; return [{id:'leave',label:'[leave]',x:MARGX,w:floor(PADY*4.5)}]; }
 function drawFooter(){
   const fy=MAXY+HEADER_H; noStroke(); fill(32); rect(0,fy,MAXX,FOOTER_H); stroke(55); strokeWeight(1); line(0,fy,MAXX,fy); noStroke();
   const by=fy+(FOOTER_H-FB_H)/2;
   for(const b of footerBtns()){ if(b.tint) uiClearBtn(b.x,by,b.w,FB_H); else uiBtn(b.label,b.x,by,b.w,FB_H); }
   const ol=getOnlineList(), g=onlinePanelGeom(ol,fy);
-  const obW=76, obx=MAXX-MARGX-obW;
+  const obW=floor(PADY*4.75), obx=MAXX-MARGX-obW;
   if(isHov(obx,by,obW,FB_H)) cursor(HAND);
   uiBtn(ol.length+' online',obx,by,obW,FB_H,onlinePanelOpen);
   if(onlinePanelOpen&&(ol.length>0||g.hasBlocked)){
     strokeWeight(1); stroke(65); fill(24); rect(g.panelX,g.panelY,g.panelW,g.panelH,3); noStroke();
-    const bH=14,bBX=g.panelX+g.panelW-4-14,bRX=bBX-2-14,bKX=bRX-2-14,bHX=bKX-2-14,bOX=bHX-2-14,bMX=bOX-2-14,bMUX=bMX-2-14;
+    const bH=floor(PADY*0.875), bBX=g.panelX+g.panelW-4-bH, bRX=bBX-2-bH, bKX=bRX-2-bH, bHX=bKX-2-bH, bOX=bHX-2-bH, bMX=bOX-2-bH, bMUX=bMX-2-floor(bH*1.125);
     for(let i=0;i<ol.length;i++){
       const u=ol[i], ry=g.panelY+g.padY+i*g.rowH;
       const confOwner=isHost&&pendingConfirm?.cmd==='owner'&&pendingConfirm?.name===u.name;
@@ -709,23 +708,23 @@ function drawFooter(){
       if(confOwner){ noStroke(); fill(15,65,75,100);  rect(g.panelX+2,ry,g.panelW-4,g.rowH,2); }
       if(confMod)  { noStroke(); fill(15,30,65,100);  rect(g.panelX+2,ry,g.panelW-4,g.rowH,2); }
       if(confOp)   { noStroke(); fill(50,35,10,100);  rect(g.panelX+2,ry,g.panelW-4,g.rowH,2); }
-      const pg=getAvatarGfx(u.name);
-      if(pg){ noSmooth(); image(pg,g.panelX+g.padX,ry+3,14,14); smooth(); }
-      else  { fill(u.color); ellipse(g.panelX+g.padX+4,ry+8,8,8); }
-      let nameX=g.panelX+g.padX+18;
+      const avatarSz=floor(g.rowH*0.75), pg=getAvatarGfx(u.name);
+      if(pg){ noSmooth(); image(pg,g.panelX+g.padX,ry+floor((g.rowH-avatarSz)/2),avatarSz,avatarSz); smooth(); }
+      else  { fill(u.color); ellipse(g.panelX+g.padX+avatarSz/2,ry+g.rowH/2,avatarSz*0.65,avatarSz*0.65); }
+      let nameX=g.panelX+g.padX+avatarSz+4;
       const badge=getRoleBadge(u.name);
-      if(badge){ fill(color(...badge.c)); textSize(9); textAlign(LEFT,TOP); text(badge.l,nameX,ry+3); nameX+=badge.l.length>3?30:24; }
-      if(isHost&&roomPasswords[u.name]){ fill(130); textSize(9); textAlign(LEFT,TOP); text('🔒',nameX,ry+2); nameX+=14; }
-      fill(190); textSize(11); textAlign(LEFT,TOP);
-      const rightBtnsW=isHost&&u.name!==username?4+14+2+14+2+14+2+14+2+14+2+14+2+14:4;
-      const maxChars=max(4,floor((g.panelX+g.panelW-rightBtnsW-nameX)/7));
-      text(u.name.length>maxChars?u.name.slice(0,maxChars-1)+'…':u.name,nameX,ry+2);
-      if(isHost&&u.name!==username){ const isMuted=mutedNames.has(u.name); uiMuteBtn(isMuted?'UM':'MU',bMUX,ry+3,14,bH,isMuted); uiModBtn('M',bMX,ry+3,14,bH,confMod); uiOpBtn('O',bOX,ry+3,14,bH,confOp); uiHostBtn('H',bHX,ry+3,14,bH,confOwner); uiKickBtn('K',bKX,ry+3,14,bH); uiRemoveBtn('R',bRX,ry+3,14,bH); uiBanBtn('B',bBX,ry+3,14,bH); }
+      if(badge){ fill(color(...badge.c)); textSize(max(7,fontSize-4)); textAlign(LEFT,TOP); text(badge.l,nameX,ry+floor(g.rowH*0.2)); nameX+=badge.l.length>3?floor(PADY*1.875):floor(PADY*1.5); }
+      if(isHost&&roomPasswords[u.name]){ fill(130); textSize(max(7,fontSize-4)); textAlign(LEFT,TOP); text('🔒',nameX,ry+floor(g.rowH*0.1)); nameX+=floor(PADY*0.875); }
+      fill(190); textSize(max(9,fontSize-1)); textAlign(LEFT,TOP);
+      const rightBtnsW=isHost&&u.name!==username?4+bH*7+2*6:4;
+      const maxChars=max(4,floor((g.panelX+g.panelW-rightBtnsW-nameX)/max(6,fontSize*0.6)));
+      text(u.name.length>maxChars?u.name.slice(0,maxChars-1)+'…':u.name,nameX,ry+floor(g.rowH*0.1));
+      if(isHost&&u.name!==username){ const isMuted=mutedNames.has(u.name); uiMuteBtn(isMuted?'UM':'MU',bMUX,ry+floor(g.rowH*0.15),floor(bH*1.125),bH,isMuted); uiModBtn('M',bMX,ry+floor(g.rowH*0.15),bH,bH,confMod); uiOpBtn('O',bOX,ry+floor(g.rowH*0.15),bH,bH,confOp); uiHostBtn('H',bHX,ry+floor(g.rowH*0.15),bH,bH,confOwner); uiKickBtn('K',bKX,ry+floor(g.rowH*0.15),bH,bH); uiRemoveBtn('R',bRX,ry+floor(g.rowH*0.15),bH,bH); uiBanBtn('B',bBX,ry+floor(g.rowH*0.15),bH,bH); }
     }
     if(g.hasBlocked){
-      if(ol.length>0){ const dY=g.panelY+g.padY+ol.length*g.rowH+5; stroke(52);strokeWeight(1);line(g.panelX+6,dY,g.panelX+g.panelW-6,dY);noStroke(); }
-      const pdnW=22, pdnX=g.panelX+g.panelW-4-pdnW;
-      for(let i=0;i<g.bl.length;i++){ const b=g.bl[i], ry=g.blockedBaseY+i*g.rowH; fill(b.type==='ban'?color(150,55,55):color(150,118,40)); textSize(8);textAlign(LEFT,TOP);text(b.type==='ban'?'ban':'rm',g.panelX+g.padX,ry+4); fill(115);textSize(11);textAlign(LEFT,TOP);text(b.name,g.panelX+g.padX+22,ry+2); uiPardonBtn('pdn',pdnX,ry+3,pdnW,bH); }
+      if(ol.length>0){ const dY=g.panelY+g.padY+ol.length*g.rowH+floor(g.rowH*0.3125); stroke(52);strokeWeight(1);line(g.panelX+6,dY,g.panelX+g.panelW-6,dY);noStroke(); }
+      const pdnW=floor(PADY*1.375), pdnX=g.panelX+g.panelW-4-pdnW;
+      for(let i=0;i<g.bl.length;i++){ const b=g.bl[i], ry=g.blockedBaseY+i*g.rowH; fill(b.type==='ban'?color(150,55,55):color(150,118,40)); textSize(max(7,fontSize-4));textAlign(LEFT,TOP);text(b.type==='ban'?'ban':'rm',g.panelX+g.padX,ry+floor(g.rowH*0.25)); fill(115);textSize(max(9,fontSize-1));textAlign(LEFT,TOP);text(b.name,g.panelX+g.padX+floor(PADY*1.375),ry+floor(g.rowH*0.1)); uiPardonBtn('pdn',pdnX,ry+floor(g.rowH*0.2),pdnW,bH); }
     }
   }
 }
@@ -737,39 +736,37 @@ function mousePressed(){ if(appState==='setup') handleSetupClick(); else handleC
 function doubleClicked(){
   if(appState!=='setup') return;
   const fx=MAXX/2-SFW/2; let cy=SY_CONT;
-  if(setupMode==='create'){ cy+=SFH+10+CBH+12; const l=roomListLayout('create',cy); if(l) for(const {room,y} of l.rows) if(isHov(fx,y,SFW-18,20)){ fRname=room.rname!==room.id?room.rname:room.id; doCreateRoom(); return; } }
-  if(setupMode==='join')  { cy+=SFH+10+CBH+12; const l=roomListLayout('join',cy);   if(l) for(const {room,y} of l.rows) if(isHov(fx,y,SFW-18,20)){ fJroom=room.id; doJoinRoom(); return; } }
+  if(setupMode==='create'){ cy+=SFH+floor(PADY*0.625)+CBH+floor(PADY*0.75); const l=roomListLayout('create',cy); if(l) for(const {room,y} of l.rows) if(isHov(fx,y,SFW-floor(PADY*1.25),floor(PADY*1.25))){ fRname=room.rname!==room.id?room.rname:room.id; doCreateRoom(); return; } }
+  if(setupMode==='join'){   cy+=SFH+floor(PADY*0.625)+CBH+floor(PADY*0.75); const l=roomListLayout('join',cy);   if(l) for(const {room,y} of l.rows) if(isHov(fx,y,SFW-floor(PADY*1.25),floor(PADY*1.25))){ fJroom=room.id; doJoinRoom(); return; } }
 }
 function handleSetupClick(){
   const cx=MAXX/2, fx=cx-SFW/2;
-  const mb1x=cx-117, mb2x=cx-37, mb3x=cx+43;
+  const mb1x=cx-floor(MBW*1.5)-5, mb2x=cx-floor(MBW/2), mb3x=cx+floor(MBW/2)+5;
   if(isHov(mb1x,SY_MBTNS,MBW,MBH)){ if(setupMode!=='create'){setupMode='create';focusField='rname';setStatus('');startPingingForMode('create');} return; }
   if(isHov(mb2x,SY_MBTNS,MBW,MBH)){ if(setupMode!=='join')  {setupMode='join';  focusField='jroom';setStatus('');startPingingForMode('join');  } return; }
   if(isHov(mb3x,SY_MBTNS,MBW,MBH)){ if(setupMode!=='profile'){setupMode='profile';focusField='uname';stopPinging();setStatus('');} return; }
   let cy=SY_CONT;
-  if(setupMode==='create'){ if(isHov(fx,cy,SFW,SFH)){focusField='rname';return;} cy+=SFH+10; if(isHov(cx-CBW/2,cy,CBW,CBH)){doCreateRoom();return;} cy+=CBH+12; const l=roomListLayout('create',cy); if(l) for(const {room,y} of l.rows){ if(isHov(fx+SFW-18,y+3,14,14)){deleteCreatedRoom(room.id);delete roomStatuses[room.id];return;} if(isHov(fx,y,SFW-18,20)){fRname=room.rname!==room.id?room.rname:room.id;focusField='rname';return;} } }
-  if(setupMode==='join'){   if(isHov(fx,cy,SFW,SFH)){focusField='jroom';return;} cy+=SFH+10; if(isHov(cx-CBW/2,cy,CBW,CBH)){doJoinRoom();return;} cy+=CBH+12; const l=roomListLayout('join',cy);   if(l) for(const {room,y} of l.rows){ if(isHov(fx+SFW-18,y+3,14,14)){deleteJoinedRoom(room.id);delete roomStatuses[room.id];return;} if(isHov(fx,y,SFW-18,20)){fJroom=room.id;focusField='jroom';return;} } }
+  const rowH=floor(PADY*1.25);
+  if(setupMode==='create'){ if(isHov(fx,cy,SFW,SFH)){focusField='rname';return;} cy+=SFH+floor(PADY*0.625); if(isHov(cx-CBW/2,cy,CBW,CBH)){doCreateRoom();return;} cy+=CBH+floor(PADY*0.75); const l=roomListLayout('create',cy); if(l) for(const {room,y} of l.rows){ if(isHov(fx+SFW-rowH,y+floor(rowH*0.2),rowH-4,rowH-4)){deleteCreatedRoom(room.id);delete roomStatuses[room.id];return;} if(isHov(fx,y,SFW-rowH,rowH)){fRname=room.rname!==room.id?room.rname:room.id;focusField='rname';return;} } }
+  if(setupMode==='join'){   if(isHov(fx,cy,SFW,SFH)){focusField='jroom';return;} cy+=SFH+floor(PADY*0.625); if(isHov(cx-CBW/2,cy,CBW,CBH)){doJoinRoom();return;} cy+=CBH+floor(PADY*0.75); const l=roomListLayout('join',cy); if(l) for(const {room,y} of l.rows){ if(isHov(fx+SFW-rowH,y+floor(rowH*0.2),rowH-4,rowH-4)){deleteJoinedRoom(room.id);delete roomStatuses[room.id];return;} if(isHov(fx,y,SFW-rowH,rowH)){fJroom=room.id;focusField='jroom';return;} } }
   if(setupMode==='profile'){
-    if(isHov(fx,cy,SFW,SFH)){focusField='uname';return;} cy+=SFH+16;
-    const cfw=SFW-SFH-8; if(isHov(fx,cy,cfw,SFH)){focusField='color';return;} cy+=SFH+10;
-    const {gx,gy}=avGridPos(); const ppx=gx+8*AV_CS+5;
+    if(isHov(fx,cy,SFW,SFH)){focusField='uname';return;} cy+=SFH+PADY;
+    const cfw=SFW-SFH-8; if(isHov(fx,cy,cfw,SFH)){focusField='color';return;} cy+=SFH+floor(PADY*0.625);
+    const {gx,gy}=avGridPos(); const ppx=gx+8*AV_CS+floor(PADY*0.3125);
     for(let i=0;i<AV_PALETTE.length;i++){ const pr=floor(i/2),pc=i%2,bx=ppx+pc*(AV_PCW+2),by=gy+pr*(AV_PCH+2); if(isHov(bx,by,AV_PCW,AV_PCH)){avPalIdx=i;return;} }
     if(isHov(gx,gy,8*AV_CS,8*AV_CS)){ if(!fAvatar) initAvatarDefault(); paintAvatarCell(mouseX,mouseY,gx,gy); return; }
-    const btnY=gy+8*AV_CS+6;
-    if(isHov(gx,btnY,53,18)){fAvatar=new Array(64).fill(getAvPaintColor());saveProfile();return;}
-    if(isHov(gx+57,btnY,53,18)){fAvatar=new Array(64).fill('');saveProfile();return;}
+    const btnH=floor(SFH*0.65), btnY=gy+8*AV_CS+floor(PADY*0.375);
+    if(isHov(gx,btnY,floor(CBW*0.6),btnH)){fAvatar=new Array(64).fill(getAvPaintColor());saveProfile();return;}
+    if(isHov(gx+floor(CBW*0.6)+4,btnY,floor(CBW*0.6),btnH)){fAvatar=new Array(64).fill('');saveProfile();return;}
   }
 }
 function handleChatClick(){
   const cmy=mouseY-HEADER_H;
   for(const r of linkRegions){ if(mouseX>=r.x&&mouseX<=r.x+r.w&&cmy>=r.y&&cmy<=r.y+r.h){ window.open(r.url,'_blank','noopener,noreferrer'); return; } }
-
-  // Header font-size buttons
-  const {hy,bw,numW,gap,x_plus,x_num,x_minus,x_copy}=fontBtnLayout();
-  if(isHov(x_plus, hy,bw,16)){ fontSize=min(FONT_MAX,fontSize+1); return; }
-  if(isHov(x_minus,hy,bw,16)){ fontSize=max(FONT_MIN,fontSize-1); return; }
-  if(isHost&&roomIdStr&&isHov(x_copy,hy,52,16)){ navigator.clipboard.writeText(roomIdStr).then(()=>{copyLabel='Copied!';setTimeout(()=>{copyLabel='copy ID';},2000);}); return; }
-
+  const {hy,bw,numW,gap,x_plus,x_num,x_minus,x_copy,h}=fontBtnLayout();
+  if(isHov(x_plus, hy,bw,h)){ changeFontSize(1);  return; }
+  if(isHov(x_minus,hy,bw,h)){ changeFontSize(-1); return; }
+  if(isHost&&roomIdStr&&isHov(x_copy,hy,floor(PADY*3.25),h)){ navigator.clipboard.writeText(roomIdStr).then(()=>{copyLabel='Copied!';setTimeout(()=>{copyLabel='copy ID';},2000);}); return; }
   const fy=MAXY+HEADER_H, by=fy+(FOOTER_H-FB_H)/2;
   for(const b of footerBtns()){
     if(!isHov(b.x,by,b.w,FB_H)) continue;
@@ -780,26 +777,26 @@ function handleChatClick(){
     else if(b.id==='leave') doLeave();
     return;
   }
-  if(scrollOffset>0){ const bW=58,bH=16,bX=MAXX/2-bW/2,bY=MAXY-TBOXY-bH-6; if(mouseX>=bX&&mouseX<=bX+bW&&cmy>=bY&&cmy<=bY+bH){ scrollOffset=0; return; } }
-  const obW=76, obx=MAXX-MARGX-obW;
+  if(scrollOffset>0){ const bW=floor(PADY*3.625),bH=floor(PADY),bX=MAXX/2-bW/2,bY=MAXY-TBOXY-bH-6; if(mouseX>=bX&&mouseX<=bX+bW&&cmy>=bY&&cmy<=bY+bH){ scrollOffset=0; return; } }
+  const obW=floor(PADY*4.75), obx=MAXX-MARGX-obW;
   if(isHov(obx,by,obW,FB_H)){onlinePanelOpen=!onlinePanelOpen;pendingConfirm=null;return;}
   if(onlinePanelOpen){
     const ol=getOnlineList(), g=onlinePanelGeom(ol,fy);
     if(isHov(g.panelX,g.panelY,g.panelW,g.panelH)){
       if(isHost){
-        const bH=14,bBX=g.panelX+g.panelW-4-14,bRX=bBX-2-14,bKX=bRX-2-14,bHX=bKX-2-14,bOX=bHX-2-14,bMX=bOX-2-14,bMUX=bMX-2-14;
+        const bH=floor(PADY*0.875), bBX=g.panelX+g.panelW-4-bH, bRX=bBX-2-bH, bKX=bRX-2-bH, bHX=bKX-2-bH, bOX=bHX-2-bH, bMX=bOX-2-bH, bMUX=bMX-2-floor(bH*1.125);
         for(let i=0;i<ol.length;i++){
           const u=ol[i]; if(u.name===username) continue;
           const ry=g.panelY+g.padY+i*g.rowH;
-          if(isHov(bMUX,ry+3,14,bH)){ mutedNames.has(u.name)?doUnmute(u.name):doMute(u.name); pendingConfirm=null; return; }
-          if(isHov(bMX,ry+3,14,bH)){ if(pendingConfirm?.cmd==='mod'&&pendingConfirm?.name===u.name){ pendingConfirm=null; userRank(u.name)===2?sendOrExecModAction('revoke',u.name):sendOrExecModAction('grant',u.name,'mod'); } else pendingConfirm={cmd:'mod',name:u.name}; return; }
-          if(isHov(bOX,ry+3,14,bH)){ if(pendingConfirm?.cmd==='op'&&pendingConfirm?.name===u.name){ pendingConfirm=null; userRank(u.name)===3?sendOrExecModAction('revoke',u.name):sendOrExecModAction('grant',u.name,'op'); } else pendingConfirm={cmd:'op',name:u.name}; return; }
-          if(isHov(bHX,ry+3,14,bH)){ if(pendingConfirm?.cmd==='owner'&&pendingConfirm?.name===u.name){pendingConfirm=null;doTransferHost(u.name);}else pendingConfirm={cmd:'owner',name:u.name}; return; }
-          if(isHov(bKX,ry+3,14,bH)){doKick(u.name);   pendingConfirm=null;return;}
-          if(isHov(bRX,ry+3,14,bH)){doRemove(u.name); pendingConfirm=null;return;}
-          if(isHov(bBX,ry+3,14,bH)){doBan(u.name);    pendingConfirm=null;return;}
+          if(isHov(bMUX,ry+floor(g.rowH*0.15),floor(bH*1.125),bH)){ mutedNames.has(u.name)?doUnmute(u.name):doMute(u.name); pendingConfirm=null; return; }
+          if(isHov(bMX, ry+floor(g.rowH*0.15),bH,bH)){ if(pendingConfirm?.cmd==='mod'&&pendingConfirm?.name===u.name){ pendingConfirm=null; userRank(u.name)===2?sendOrExecModAction('revoke',u.name):sendOrExecModAction('grant',u.name,'mod'); } else pendingConfirm={cmd:'mod',name:u.name}; return; }
+          if(isHov(bOX, ry+floor(g.rowH*0.15),bH,bH)){ if(pendingConfirm?.cmd==='op'&&pendingConfirm?.name===u.name){ pendingConfirm=null; userRank(u.name)===3?sendOrExecModAction('revoke',u.name):sendOrExecModAction('grant',u.name,'op'); } else pendingConfirm={cmd:'op',name:u.name}; return; }
+          if(isHov(bHX, ry+floor(g.rowH*0.15),bH,bH)){ if(pendingConfirm?.cmd==='owner'&&pendingConfirm?.name===u.name){pendingConfirm=null;doTransferHost(u.name);}else pendingConfirm={cmd:'owner',name:u.name}; return; }
+          if(isHov(bKX, ry+floor(g.rowH*0.15),bH,bH)){doKick(u.name);   pendingConfirm=null;return;}
+          if(isHov(bRX, ry+floor(g.rowH*0.15),bH,bH)){doRemove(u.name); pendingConfirm=null;return;}
+          if(isHov(bBX, ry+floor(g.rowH*0.15),bH,bH)){doBan(u.name);    pendingConfirm=null;return;}
         }
-        if(g.hasBlocked){ const pdnW=22,pdnX=g.panelX+g.panelW-4-pdnW; for(let i=0;i<g.bl.length;i++){ const ry=g.blockedBaseY+i*g.rowH; if(isHov(pdnX,ry+3,pdnW,14)){doPardon(g.bl[i].name);return;} } }
+        if(g.hasBlocked){ const pdnW=floor(PADY*1.375),pdnX=g.panelX+g.panelW-4-pdnW; for(let i=0;i<g.bl.length;i++){ const ry=g.blockedBaseY+i*g.rowH; if(isHov(pdnX,ry+floor(g.rowH*0.2),pdnW,floor(PADY*0.875))){doPardon(g.bl[i].name);return;} } }
       }
       return;
     }
@@ -811,7 +808,7 @@ function handleChatClick(){
 //  SETUP KEY HANDLER
 // ================================================================
 function handleSetupKey(){
-  if(keyIsDown(CONTROL)||keyIsDown(91)||keyIsDown(93)) return; // let native listener handle ctrl combos
+  if(keyIsDown(CONTROL)||keyIsDown(91)||keyIsDown(93)) return;
   if(keyCode===TAB){ const vis=setupMode==='profile'?['uname','color']:setupMode==='create'?['rname']:setupMode==='join'?['jroom']:[];if(vis.length)focusField=vis[(vis.indexOf(focusField)+1)%vis.length];return; }
   if(keyCode===ENTER){ if(setupMode==='create')doCreateRoom();else if(setupMode==='join')doJoinRoom();return; }
   if(keyCode===BACKSPACE){ if(focusField==='uname')fUname=fUname.slice(0,-1);else if(focusField==='rname')fRname=fRname.slice(0,-1);else if(focusField==='jroom')fJroom=fJroom.slice(0,-1);else if(focusField==='color')fColor=fColor.slice(0,-1);if(setupMode==='profile')saveProfile();return; }
@@ -848,12 +845,8 @@ document.addEventListener('keydown',e=>{
   const ctrl=e.ctrlKey||e.metaKey;
 
   // Font size — works everywhere
-  if(ctrl&&(e.key==='='||e.key==='+'||e.key==='NumpadAdd')){
-    fontSize=min(FONT_MAX,fontSize+1); e.preventDefault(); return;
-  }
-  if(ctrl&&(e.key==='-'||e.key==='NumpadSubtract')){
-    fontSize=max(FONT_MIN,fontSize-1); e.preventDefault(); return;
-  }
+  if(ctrl&&(e.key==='='||e.key==='+'||e.key==='NumpadAdd')){ changeFontSize(1);  e.preventDefault(); return; }
+  if(ctrl&&(e.key==='-'||e.key==='NumpadSubtract')){         changeFontSize(-1); e.preventDefault(); return; }
 
   // Setup field ctrl shortcuts
   if(appState==='setup'&&focusField&&ctrl){
@@ -868,7 +861,6 @@ document.addEventListener('keydown',e=>{
   }
 
   if(appState!=='chat') return;
-
   if(ctrl){
     if(e.key==='c'){navigator.clipboard.writeText(working_text);e.preventDefault();return;}
     if(e.key==='x'){undoSnapshot();navigator.clipboard.writeText(working_text);inputSet('',0);e.preventDefault();return;}
