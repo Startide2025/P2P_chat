@@ -443,7 +443,7 @@ function drawSegments(segs,x,by,msgCol){
       stroke(color(90,160,230)); strokeWeight(0.5); line(x,by+1,x+w,by+1); noStroke();
       linkRegions.push({url:s.text,x,y:by-PADY+3,w,h:PADY});
     } else if(s.highlight){
-      noStroke(); fill(color(215,185,40,85)); rect(x-1,rT,w+2,rH,2);
+      noStroke(); fill(color(215,185,40,85)); rect(x-1,by-fontSize+2,w+2,fontSize+2,2);
       fill(msgCol); text(s.text,x,by);
     } else {
       fill(msgCol); text(s.text,x,by);
@@ -955,3 +955,4 @@ document.getElementById('ri').addEventListener('change',e=>{
 </script>
 </body>
 </html>
+  
