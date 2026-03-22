@@ -1,20 +1,32 @@
 <!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>p2p chat</title></head>
-<body style="margin:0;background:#2a2a2a;display:flex;justify-content:center;padding:10px">
+<body style="margin:0;padding:0;overflow:hidden;background:#2a2a2a;display:flex;justify-content:center;align-items:flex-start">
 <input type="file" id="ri" accept=".json" style="display:none">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script>
 
+const VERSION=7;
+
 // ================================================================
 //  NETWORKING STATE
 // ================================================================
-const VERSION = 6;
-
 let peer=null, isHost=false, hostConn=null, clientConns=[];
 let clientConnNames=new Map();
 let removedNames=new Set(), permanentBans=new Set(), mutedNames=new Set();
 let hostUsername='';
+
+// ================================================================
+//  AUTH STATE
+// ================================================================
+let roomPasswords={}, pendingAuthConns=new Map(), authPending=false;
+
+async function hashPassword(pw){
+  const buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(pw));
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+function loadPasswords(rid){ try{ roomPasswords=JSON.parse(localStorage.getItem('passwd:'+rid)||'{}'); }catch(e){ roomPasswords={}; } }
+function savePasswords(rid){ if(!rid)return; try{ localStorage.setItem('passwd:'+rid,JSON.stringify(roomPasswords)); }catch(e){} }
 
 // ================================================================
 //  ROLE STATE
@@ -27,10 +39,7 @@ function loadRoles(rid){
     persistentOps=new Set(r.ops||[]); persistentMods=new Set(r.mods||[]);
   }catch(e){ persistentOps=new Set(); persistentMods=new Set(); }
 }
-function saveRoles(rid){
-  if(!rid)return;
-  try{ localStorage.setItem('roles:'+rid,JSON.stringify({ops:[...persistentOps],mods:[...persistentMods]})); }catch(e){}
-}
+function saveRoles(rid){ if(!rid)return; try{ localStorage.setItem('roles:'+rid,JSON.stringify({ops:[...persistentOps],mods:[...persistentMods]})); }catch(e){} }
 function clearRoleSets(){ persistentOps=new Set(); persistentMods=new Set(); sessionOps=new Set(); sessionMods=new Set(); }
 
 function _deriveRole(name){
@@ -62,10 +71,7 @@ function getRoleBadge(name){
 // ================================================================
 //  ROLE GRANT / REVOKE
 // ================================================================
-function _silentClearRole(name){
-  persistentOps.delete(name); sessionOps.delete(name);
-  persistentMods.delete(name); sessionMods.delete(name);
-}
+function _silentClearRole(name){ persistentOps.delete(name); sessionOps.delete(name); persistentMods.delete(name); sessionMods.delete(name); }
 function doGrantRole(name,role){
   _silentClearRole(name);
   if(role==='op')           persistentOps.add(name);
@@ -108,489 +114,44 @@ function sendOrExecModAction(action,target,roleArg){
 }
 
 // ================================================================
-//  BANS
+//  BANS / UTILS
 // ================================================================
 function isBlocked(n){ return removedNames.has(n)||permanentBans.has(n); }
-function loadPermanentBans(){
-  try{ const b=JSON.parse(localStorage.getItem('bans')||'[]'); permanentBans=new Set(Array.isArray(b)?b:[]); }
-  catch(e){ permanentBans=new Set(); }
-}
-function savePermanentBans(){
-  try{ localStorage.setItem('bans',JSON.stringify([...permanentBans])); }catch(e){}
-}
-function colorFromId(id){
-  let h=5381; for(let i=0;i<id.length;i++) h=((h<<5)+h)^id.charCodeAt(i);
-  return 'hsl('+((Math.abs(h)%288)+36)+', 58%, 64%)';
-}
+function loadPermanentBans(){ try{ const b=JSON.parse(localStorage.getItem('bans')||'[]'); permanentBans=new Set(Array.isArray(b)?b:[]); }catch(e){ permanentBans=new Set(); } }
+function savePermanentBans(){ try{ localStorage.setItem('bans',JSON.stringify([...permanentBans])); }catch(e){} }
+function colorFromId(id){ let h=5381; for(let i=0;i<id.length;i++) h=((h<<5)+h)^id.charCodeAt(i); return 'hsl('+((Math.abs(h)%288)+36)+', 58%, 64%)'; }
 function resolvedColor(id){ const c=fColor.trim(); return c?c:colorFromId(id); }
-function broadcastToClients(data,exceptConn){
-  for(const c of clientConns) if(c!==exceptConn&&c.open) c.send(data);
-}
+function broadcastToClients(data,exceptConn){ for(const c of clientConns) if(c!==exceptConn&&c.open) c.send(data); }
 function connForName(n){ for(const [c,nm] of clientConnNames) if(nm===n) return c; return null; }
+function sanitizeAvatar(av){ if(!Array.isArray(av)||av.length!==64) return null; if(av.some(c=>typeof c!=='string'||c.length>32)) return null; return av; }
 
 // ================================================================
-//  INCOMING MESSAGE HANDLER
+//  LAYOUT  (all dynamic — recomputed on resize)
 // ================================================================
-function handleIncoming(data,fromConn){
-  if(data.type==='message'){
-    if(isHost&&mutedNames.has(data.name)) return; // silently drop
-    pushMsg({name:data.name,message:data.message,color:data.color||null,avatar:data.avatar||null});
-    if(isHost) broadcastToClients(data,fromConn);
-
-  } else if(data.type==='user_info'){
-    if(isHost&&data.version!==VERSION){
-      if(fromConn&&fromConn.open){
-        fromConn.send({type:'kick',banType:'version',theirVersion:data.version,ourVersion:VERSION});
-        setTimeout(()=>fromConn.close(),200);
-      }
-      return;
-    }
-    if(isHost&&isBlocked(data.name)){
-      if(fromConn&&fromConn.open){
-        fromConn.send({type:'kick',banType:permanentBans.has(data.name)?'ban':'remove'});
-        setTimeout(()=>fromConn.close(),200);
-      }
-      return;
-    }
-    users[data.name]={color:data.color,online:true,avatar:data.avatar||null,
-      role:isHost?_deriveRole(data.name):(data.role||null)};
-    invalidateAvatarCache(data.name);
-    if(isHost){
-      clientConnNames.set(fromConn,data.name);
-      const jm=data.name+' joined';
-      pushMsg({name:'server',message:jm});
-      broadcastToClients({type:'user_info',name:data.name,color:data.color,
-        avatar:data.avatar||null,role:_deriveRole(data.name)},fromConn);
-      broadcastToClients({type:'message',name:'server',message:jm},fromConn);
-    }
-
-  } else if(data.type==='user_leave'){
-    if(users[data.name]) users[data.name].online=false;
-    pushMsg({name:'server',message:data.name+' left'});
-    if(isHost) broadcastToClients(data,fromConn);
-
-  } else if(data.type==='kick'){
-    const reason=data.banType==='ban'   ?'You were permanently banned from this room.'  :
-                 data.banType==='remove'?'You were removed from this room this session.' :
-                 data.banType==='version'?'Version mismatch: room is v'+data.ourVersion+', you are v'+data.theirVersion+'.' :
-                                         'You were kicked from this room.';
-    pushMsg({name:'server',message:reason});
-    setTimeout(()=>resetToSetup(),1500);
-
-  } else if(data.type==='room_end'){
-    pushMsg({name:'server',message:'Host ended the room.'});
-    setTimeout(()=>resetToSetup(),1500);
-
-  } else if(data.type==='role_update'){
-    if(users[data.name]) users[data.name].role=data.role;
-
-  } else if(data.type==='mod_action'){
-    if(!isHost) return;
-    const actorName=clientConnNames.get(fromConn);
-    if(!actorName||actorName!==data.actor) return;
-    const ar=userRank(actorName), tr=userRank(data.target);
-    if(ar<=tr) return;
-    const act=data.action;
-    if(act==='kick'        &&ar>=2) doKick(data.target);
-    else if(act==='remove' &&ar>=2) doRemove(data.target);
-    else if(act==='mute'   &&ar>=2) doMute(data.target);
-    else if(act==='unmute' &&ar>=2) doUnmute(data.target);
-    else if(act==='ban'    &&ar>=3) doBan(data.target);
-    else if(act==='pardon' &&ar>=3) doPardon(data.target);
-    else if(act==='grant'){
-      const needed=(data.roleArg==='op'||data.roleArg==='tempop')?4:3;
-      if(ar>=needed) doGrantRole(data.target,data.roleArg);
-    } else if(act==='revoke'){
-      const needed=(tr>=3)?4:3;
-      if(ar>=needed) doRevokeRole(data.target);
-    }
-
-  } else if(data.type==='init'){
-    if(data.version!==undefined&&data.version!==VERSION)
-      pushMsg({name:'server',message:'warning: room is v'+data.version+', you are v'+VERSION+' -- things may not work correctly.'});
-    history.length=0; data.history.forEach(m=>pushMsg(m));
-    Object.assign(users,data.users);
-    Object.keys(data.users).forEach(n=>invalidateAvatarCache(n));
-    if(data.hostName) hostUsername=data.hostName;
-
-  } else if(data.type==='become_host'){
-    const origId=data.roomId;
-    history.length=0; data.history.forEach(m=>pushMsg(m));
-    Object.assign(users,data.users);
-    persistentOps=new Set(data.persistentOps||[]);
-    persistentMods=new Set(data.persistentMods||[]);
-    sessionOps=new Set(data.sessionOps||[]);
-    sessionMods=new Set(data.sessionMods||[]);
-    if(hostConn){try{hostConn.close();}catch(e){} hostConn=null;}
-    clientConns=[]; clientConnNames=new Map();
-    if(peer){peer.destroy();peer=null;}
-    function _claimHost(id){
-      peer=new Peer(id,{debug:0});
-      peer.on('open',rid=>{
-        isHost=true; hostUsername=username; roomIdStr=rid;
-        setupHostListeners();
-        roomBarStr=rid+'  |  host  |  '+username;
-        pushMsg({name:'server',message:'You are now the host.'+(rid!==origId?' (new ID: '+rid+')':'')});
-      });
-      peer.on('error',e=>{
-        if(e.type==='unavailable-id'&&id===origId) setTimeout(()=>_claimHost(undefined),400);
-      });
-    }
-    setTimeout(()=>_claimHost(origId),350);
-
-  } else if(data.type==='new_host'){
-    hostUsername=data.name;
-    pushMsg({name:'server',message:data.name+' is now the host.'});
-    if(hostConn){try{hostConn.close();}catch(e){} hostConn=null;}
-    roomIdStr=data.peerId;
-    setTimeout(()=>{
-      const nc=peer.connect(data.peerId,{reliable:true}); hostConn=nc;
-      nc.on('open',()=>{
-        nc.send({type:'user_info',name:username,color:users[username].color,avatar:fAvatar,role:userRole(username),version:VERSION});
-        roomBarStr=data.peerId+'  |  connected  |  '+username;
-      });
-      nc.on('data',  d=>handleIncoming(d,null));
-      nc.on('close',()=>{ if(appState==='chat') pushMsg({name:'server',message:'disconnected from host.'}); });
-      nc.on('error', e=>console.warn('reconnect err',e));
-    },1400);
-
-  } else if(data.type==='whisper'){
-    if(isHost&&data.to!==username){
-      const c=connForName(data.to); if(c&&c.open) c.send(data);
-    } else {
-      pushMsg({type:'whisper',from:data.from,to:data.to,message:data.message});
-    }
-
-  } else if(data.type==='delete_msg'){
-    for(let i=history.length-1;i>=0;i--){
-      const m=history[i];
-      if(m.name===data.name&&m.message===data.message&&m.type===undefined){
-        history.splice(i,1); break;
-      }
-    }
-    if(isHost) broadcastToClients(data,fromConn);
-
-  } else if(data.type==='edit_msg'){
-    for(let i=history.length-1;i>=0;i--){
-      const m=history[i];
-      if(m.name===data.name&&m.message===data.oldMsg&&m.type===undefined){
-        m.message=data.newMsg; break;
-      }
-    }
-    if(isHost) broadcastToClients(data,fromConn);
-
-  } else if(data.type==='mute_update'){
-    if(users[data.name]) users[data.name].muted=data.muted;
-
-  } else if(data.type==='muted'){
-    pushMsg({name:'server',message:data.muted?'You have been muted.':'You have been unmuted.'});
-
-  } else if(data.type==='clear_chat'){
-    history.length=0;
-    pushMsg({name:'server',message:'Chat was cleared by the host.'});
-  }
-}
-
-// ================================================================
-//  HOST LISTENERS
-// ================================================================
-function setupHostListeners(){
-  peer.on('connection',conn=>{
-    if(!isHost){conn.close();return;}
-    conn.on('open',()=>{
-      clientConns.push(conn);
-      conn.send({type:'init',
-        version:VERSION,
-        history:JSON.parse(JSON.stringify(history.filter(m=>m.type!=='_hr'&&m.type!=='_help'))),
-        users:  JSON.parse(JSON.stringify(users)),
-        hostName:username});
-    });
-    conn.on('data',  d=>handleIncoming(d,conn));
-    conn.on('close',()=>{
-      if(!isHost) return;
-      clientConns=clientConns.filter(c=>c!==conn);
-      const name=clientConnNames.get(conn); clientConnNames.delete(conn);
-      if(name&&users[name]&&users[name].online){
-        users[name].online=false;
-        const lm=name+' left';
-        pushMsg({name:'server',message:lm});
-        broadcastToClients({type:'user_leave',name},null);
-      }
-    });
-    conn.on('error',e=>console.warn('[host]',e));
-  });
-}
-
-// ================================================================
-//  KICK / REMOVE / BAN / PARDON / TRANSFER / CLEAR
-// ================================================================
-function _dispatchKick(name,banType){
-  const conn=connForName(name);
-  if(conn&&conn.open){conn.send({type:'kick',banType});setTimeout(()=>conn.close(),200);}
-  if(users[name]) users[name].online=false;
-  const lbl=banType==='ban'?'banned':banType==='remove'?'removed':'kicked';
-  const km=name+' was '+lbl;
-  pushMsg({name:'server',message:km});
-  broadcastToClients({type:'message',name:'server',message:km},conn);
-  broadcastToClients({type:'user_leave',name},conn);
-}
-function doKick(n)   { _dispatchKick(n,'kick'); }
-function doRemove(n) { removedNames.add(n);  _dispatchKick(n,'remove'); }
-function doBan(n)    { _silentClearRole(n); permanentBans.add(n); removedNames.add(n); savePermanentBans(); _dispatchKick(n,'ban'); }
-function doPardon(n) {
-  removedNames.delete(n); permanentBans.delete(n); savePermanentBans();
-  const pm=n+' was pardoned';
-  pushMsg({name:'server',message:pm});
-  broadcastToClients({type:'message',name:'server',message:pm},null);
-}
-function doMute(n) {
-  mutedNames.add(n);
-  if(users[n]) users[n].muted=true;
-  const mm=n+' was muted';
-  pushMsg({name:'server',message:mm});
-  broadcastToClients({type:'mute_update',name:n,muted:true},null);
-  broadcastToClients({type:'message',name:'server',message:mm},null);
-  const conn=connForName(n); if(conn&&conn.open) conn.send({type:'muted',muted:true});
-}
-function doUnmute(n) {
-  mutedNames.delete(n);
-  if(users[n]) users[n].muted=false;
-  const mm=n+' was unmuted';
-  pushMsg({name:'server',message:mm});
-  broadcastToClients({type:'mute_update',name:n,muted:false},null);
-  broadcastToClients({type:'message',name:'server',message:mm},null);
-  const conn=connForName(n); if(conn&&conn.open) conn.send({type:'muted',muted:false});
-}
-
-// ================================================================
-//  PENDING CONFIRM
-// ================================================================
-let pendingConfirm=null;
-function confirmOrExecute(cmd,name,fn){
-  if(pendingConfirm?.cmd===cmd&&pendingConfirm?.name===name){ pendingConfirm=null; fn(); }
-  else { pendingConfirm={cmd,name}; pushMsg({name:'server',message:'type /'+cmd+' '+name+' again to confirm'}); }
-}
-function doTransferHost(name){
-  const conn=connForName(name); pendingConfirm=null;
-  if(!conn||!conn.open) return;
-  const origId=roomIdStr;
-  conn.send({type:'become_host',history:JSON.parse(JSON.stringify(history)),users:JSON.parse(JSON.stringify(users)),
-    roomId:origId,persistentOps:[...persistentOps],persistentMods:[...persistentMods],
-    sessionOps:[...sessionOps],sessionMods:[...sessionMods]});
-  broadcastToClients({type:'new_host',peerId:origId,name},conn);
-  pushMsg({name:'server',message:'Host transferred to '+name});
-  isHost=false; hostUsername=name; clientConns=[]; clientConnNames=new Map();
-  if(peer){peer.destroy();peer=null;}
-  setTimeout(()=>{
-    peer=new Peer(undefined,{debug:0});
-    peer.on('open',()=>{
-      const nc=peer.connect(origId,{reliable:true}); hostConn=nc; roomIdStr=origId;
-      nc.on('open',()=>{ nc.send({type:'user_info',name:username,color:users[username].color,avatar:fAvatar,version:VERSION}); roomBarStr=origId+'  |  connected  |  '+username; });
-      nc.on('data',  d=>handleIncoming(d,null));
-      nc.on('close',()=>{ if(appState==='chat') pushMsg({name:'server',message:'disconnected from host.'}); });
-      nc.on('error', e=>console.warn('xfer reconnect',e));
-    });
-  },1200);
-}
-function doClearChat(){
-  history.length=0; scrollOffset=0;
-  pushMsg({name:'server',message:'Chat cleared.'});
-  broadcastToClients({type:'clear_chat'},null);
-}
-function doDeleteLast(name){
-  for(let i=history.length-1;i>=0;i--){
-    const m=history[i];
-    if(m.name===name&&m.type===undefined){
-      const msg=m.message;
-      history.splice(i,1);
-      const pkt={type:'delete_msg',name,message:msg};
-      if(isHost) broadcastToClients(pkt,null);
-      else if(hostConn&&hostConn.open) hostConn.send(pkt);
-      return true;
-    }
-  }
-  return false;
-}
-function doEditLast(name, newText){
-  for(let i=history.length-1;i>=0;i--){
-    const m=history[i];
-    if(m.name===name&&m.type===undefined){
-      const oldMsg=m.message;
-      m.message=newText;
-      const pkt={type:'edit_msg',name,oldMsg,newMsg:newText};
-      if(isHost) broadcastToClients(pkt,null);
-      else if(hostConn&&hostConn.open) hostConn.send(pkt);
-      return true;
-    }
-  }
-  return false;
-}
-
-// ================================================================
-//  HISTORY
-// ================================================================
-const HISTORY_LIMIT=200;
-function pushMsg(msg){
-  if(!msg.ts) msg.ts = Date.now();
-  const atBottom=scrollOffset===0;
-  history.push(msg);
-  if(history.length>HISTORY_LIMIT) history.splice(0,history.length-HISTORY_LIMIT);
-  if(!atBottom){ scrollOffset+=PADY; clampScroll(); }
-}
-
-// ================================================================
-//  SCROLL
-// ================================================================
-let scrollOffset=0;
-let linkRegions=[]; // [{url,x,y,w,h}] rebuilt each frame
-
-function chatAreaH(){ return MAXY-TBOXY-PADY; }
-function getMaxScroll(){ return max(0, history.length*PADY - chatAreaH()); }
-function clampScroll(){ scrollOffset=constrain(scrollOffset,0,getMaxScroll()); }
-
-function mouseWheel(event){
-  if(appState!=='chat') return;
-  scrollOffset=constrain(scrollOffset-event.delta, 0, getMaxScroll());
-  return false;
-}
-
-// ================================================================
-//  AVATAR
-// ================================================================
-const AV_PALETTE=['ERASE',null,'#f0f0f0','#888888','#111111','#e05050','#e09030','#d4c830','#50b050','#40b8c0','#5060d0','#9050c8'];
+const MARGX=20, MARGY=20, PADY=16, TBOXY=20;
+const HEADER_H=28, FOOTER_H=36;
+const MBW=74, MBH=28, CBW=88, CBH=26;
+const SFH=28, FB_H=22;
+const SB_W=4;
 const AV_CS=14, AV_PCW=13, AV_PCH=13;
-let fAvatar=null, avPalIdx=1, avatarGfxCache={};
 
-function avGridPos(){ return {gx:MAXX/2-SFW/2, gy:SY_CONT+SFH+16+SFH+10}; }
-function initAvatarDefault(){ fAvatar=new Array(64).fill(resolvedColor('preview')); }
-function getAvPaintColor(){ const p=AV_PALETTE[avPalIdx]; return p==='ERASE'?'':p===null?resolvedColor('preview'):p; }
-function invalidateAvatarCache(name){ delete avatarGfxCache[name]; }
-function getAvatarGfx(name){
-  const av=users[name]?.avatar;
-  if(!av||!av.some(c=>c)) return null;
-  const hash=av.join('|');
-  if(avatarGfxCache[name]?.hash===hash) return avatarGfxCache[name].pg;
-  const pg=createGraphics(8,8); pg.noStroke(); pg.clear();
-  for(let r=0;r<8;r++) for(let c=0;c<8;c++){
-    const col=av[r*8+c]; if(col){pg.fill(col);pg.rect(c,r,1,1);}
-  }
-  avatarGfxCache[name]={pg,hash}; return pg;
-}
-function paintAvatarCell(mx,my,gx,gy){
-  const c=floor((mx-gx)/AV_CS), r=floor((my-gy)/AV_CS);
-  if(c<0||c>7||r<0||r>7) return;
-  if(!fAvatar) initAvatarDefault();
-  fAvatar[r*8+c]=mouseButton===RIGHT?'':getAvPaintColor();
-  saveProfile();
+let MAXX, MAXY, SFW, SB_X;
+let SY_TITLE, SY_TAG, SY_UNAME, SY_MBTNS, SY_CONT;
+
+function updateLayout(){
+  MAXX = max(420, windowWidth);
+  MAXY = max(380, windowHeight - HEADER_H - FOOTER_H);
+  SFW  = min(440, MAXX - 100);
+  SB_X = MAXX - 6;
+  // Setup screen vertical rhythm — anchored proportionally
+  SY_TITLE = max(120, floor(MAXY * 0.24));
+  SY_TAG   = SY_TITLE + 24;
+  SY_UNAME = SY_TAG   + 38;
+  SY_MBTNS = SY_UNAME + SFH + 14;
+  SY_CONT  = SY_MBTNS + MBH + 14;
 }
 
-// ================================================================
-//  LOCALSTORAGE
-// ================================================================
-function saveProfile(){
-  try{ localStorage.setItem('profile',JSON.stringify({uname:fUname,color:fColor,avatar:fAvatar})); }catch(e){}
-}
-function loadProfile(){
-  try{
-    const p=JSON.parse(localStorage.getItem('profile')||'null');
-    if(p){ fUname=p.uname||''; fColor=p.color||''; fAvatar=Array.isArray(p.avatar)&&p.avatar.length===64?p.avatar:null; }
-  }catch(e){}
-}
-function saveRoomHistory(rid){
-  try{ localStorage.setItem('room:'+rid,JSON.stringify(history.filter(m=>m.type!=='_hr'&&m.type!=='_help'))); }catch(e){}
-}
-function loadRoomHistory(rid){
-  try{
-    const s=JSON.parse(localStorage.getItem('room:'+rid)||'null');
-    if(Array.isArray(s)&&s.length>0){history.length=0;s.forEach(m=>pushMsg(m));return true;}
-  }catch(e){} return false;
-}
-function loadCreatedRooms(){ try{return JSON.parse(localStorage.getItem('rooms:created')||'[]');}catch(e){return[];} }
-function loadJoinedRooms() { try{return JSON.parse(localStorage.getItem('rooms:joined') ||'[]');}catch(e){return[];} }
-function saveCreatedRoom(id,rname){
-  try{
-    let l=loadCreatedRooms(); const i=l.findIndex(r=>r.id===id), e={id,rname:rname||id,ts:Date.now()};
-    if(i>=0)l[i]=e;else l.unshift(e);
-    localStorage.setItem('rooms:created',JSON.stringify(l.slice(0,10)));
-  }catch(e){}
-}
-function saveJoinedRoom(id){
-  try{
-    let l=loadJoinedRooms(); const i=l.findIndex(r=>r.id===id), e={id,ts:Date.now()};
-    if(i>=0)l[i]=e;else l.unshift(e);
-    localStorage.setItem('rooms:joined',JSON.stringify(l.slice(0,10)));
-  }catch(e){}
-}
-function deleteCreatedRoom(id){
-  try{ localStorage.setItem('rooms:created',JSON.stringify(loadCreatedRooms().filter(r=>r.id!==id))); }catch(e){}
-}
-function deleteJoinedRoom(id){
-  try{ localStorage.setItem('rooms:joined',JSON.stringify(loadJoinedRooms().filter(r=>r.id!==id))); }catch(e){}
-}
-
-// ================================================================
-//  PING
-// ================================================================
-let pingPeer=null, roomStatuses={}, pingTimers={};
-function stopPinging(){
-  Object.values(pingTimers).forEach(t=>clearTimeout(t)); pingTimers={};
-  if(pingPeer){try{pingPeer.destroy();}catch(e){} pingPeer=null;}
-}
-function startPinging(ids){
-  stopPinging(); roomStatuses={};
-  if(!ids||!ids.length) return;
-  ids.forEach(id=>roomStatuses[id]='checking');
-  pingPeer=new Peer(undefined,{debug:0});
-  pingPeer.on('open',()=>{
-    ids.forEach(id=>{
-      try{
-        const c=pingPeer.connect(id,{reliable:false});
-        pingTimers[id]=setTimeout(()=>{ if(roomStatuses[id]==='checking') roomStatuses[id]='offline'; },4000);
-        c.on('open', ()=>{ clearTimeout(pingTimers[id]); roomStatuses[id]='online';  try{c.close();}catch(e){} });
-        c.on('error',()=>{ clearTimeout(pingTimers[id]); roomStatuses[id]='offline'; });
-      }catch(e){ roomStatuses[id]='offline'; }
-    });
-  });
-  pingPeer.on('error',()=>{ ids.forEach(id=>{ if(roomStatuses[id]==='checking') roomStatuses[id]='offline'; }); });
-}
-function startPingingForMode(mode){
-  const r=mode==='create'?loadCreatedRooms():loadJoinedRooms();
-  startPinging(r.map(r=>r.id));
-}
-
-// ================================================================
-//  UI STATE
-// ================================================================
-let appState='setup', setupMode=null, focusField='rname';
-let fUname='', fRname='', fJroom='', fColor='';
-let statusTxt='', statusType='n';
-let roomIdStr='', copyLabel='copy ID', roomBarStr='';
-let onlinePanelOpen=false;
-
-function setStatus(msg,isErr,isOk){ statusTxt=msg; statusType=isErr?'e':isOk?'o':'n'; }
-function resetToSetup(){
-  if(peer){peer.destroy();peer=null;}
-  stopPinging();
-  hostConn=null; clientConns=[]; clientConnNames=new Map();
-  removedNames=new Set(); isHost=false; hostUsername=''; mutedNames=new Set();
-  clearRoleSets();
-  history.length=0; pushMsg({name:'server',message:'Welcome!'});
-  users={server:{color:'gray'}};
-  roomBarStr=''; roomIdStr=''; copyLabel='copy ID';
-  setupMode=null; appState='setup'; onlinePanelOpen=false; pendingConfirm=null;
-  scrollOffset=0;
-  setStatus('');
-}
-
-// ================================================================
-//  LAYOUT CONSTANTS
-// ================================================================
-const MAXX=540,MAXY=550,MARGX=20,MARGY=20,PADY=16,TBOXY=20;
-const HEADER_H=28,FOOTER_H=36;
-const SFW=360,SFH=28,MBW=74,MBH=28,CBW=88,CBH=26;
-const SY_TITLE=150,SY_TAG=174,SY_UNAME=212,SY_MBTNS=254,SY_CONT=296;
-const FB_H=22;
-const SB_W=4, SB_X=MAXX-6;
+function avGridPos(){ return {gx: MAXX/2 - SFW/2, gy: SY_CONT + SFH + 16 + SFH + 10}; }
 
 // ================================================================
 //  ONLINE PANEL GEOMETRY
@@ -613,52 +174,432 @@ function onlinePanelGeom(ol,fy){
 }
 
 // ================================================================
-//  APP STATE  (user's verbatim vars)
+//  COMPLETE JOIN
+// ================================================================
+function _completeJoin(fromConn,name,color,avatar,role){
+  if(persistentOps.has(name)||persistentMods.has(name)){
+    _silentClearRole(name); saveRoles(roomIdStr);
+    pushMsg({name:'server',message:'note: '+name+' had a saved role but it was cleared on rejoin — re-grant if trusted'});
+  }
+  users[name]={color,online:true,avatar,role:_deriveRole(name)};
+  invalidateAvatarCache(name);
+  clientConnNames.set(fromConn,name);
+  const jm=name+' joined';
+  pushMsg({name:'server',message:jm});
+  fromConn.send({type:'init',version:VERSION,
+    history:JSON.parse(JSON.stringify(history.filter(m=>m.type!=='_hr'&&m.type!=='_help'))),
+    users:  JSON.parse(JSON.stringify(users)),
+    hostName:username});
+  broadcastToClients({type:'user_info',name,color,avatar,role:_deriveRole(name)},fromConn);
+  broadcastToClients({type:'message',name:'server',message:jm},fromConn);
+  if(!roomPasswords[name]) fromConn.send({type:'suggest_register'});
+}
+
+// ================================================================
+//  INCOMING MESSAGE HANDLER
+// ================================================================
+function handleIncoming(data,fromConn){
+  if(data.type==='message'){
+    if(isHost){
+      const rn=clientConnNames.get(fromConn); if(!rn) return;
+      if(data.name!==rn) data.name=rn;
+      if(mutedNames.has(rn)) return;
+    }
+    pushMsg({name:data.name,message:data.message,color:data.color||null,avatar:data.avatar||null});
+    if(isHost) broadcastToClients(data,fromConn);
+
+  } else if(data.type==='user_info'){
+    if(isHost&&data.version!==VERSION){
+      if(fromConn&&fromConn.open){ fromConn.send({type:'kick',banType:'version',theirVersion:data.version,ourVersion:VERSION}); setTimeout(()=>fromConn.close(),200); }
+      return;
+    }
+    if(isHost&&isBlocked(data.name)){
+      if(fromConn&&fromConn.open){ fromConn.send({type:'kick',banType:permanentBans.has(data.name)?'ban':'remove'}); setTimeout(()=>fromConn.close(),200); }
+      return;
+    }
+    if(isHost&&(data.name===hostUsername||getOnlineList().some(u=>u.name===data.name))){
+      if(fromConn&&fromConn.open){ fromConn.send({type:'kick',banType:'nameclash'}); setTimeout(()=>fromConn.close(),200); }
+      return;
+    }
+    data.avatar=sanitizeAvatar(data.avatar);
+    if(isHost&&roomPasswords[data.name]){
+      pendingAuthConns.set(fromConn,{name:data.name,color:data.color,avatar:data.avatar,role:data.role||null,attempts:0});
+      fromConn.send({type:'auth_required'}); return;
+    }
+    users[data.name]={color:data.color,online:true,avatar:data.avatar||null,role:isHost?_deriveRole(data.name):(data.role||null)};
+    invalidateAvatarCache(data.name);
+    if(isHost) _completeJoin(fromConn,data.name,data.color,data.avatar||null,data.role||null);
+
+  } else if(data.type==='auth_attempt'){
+    if(!isHost) return;
+    const pending=pendingAuthConns.get(fromConn); if(!pending) return;
+    pending.attempts++;
+    if(data.hash===roomPasswords[pending.name]){
+      pendingAuthConns.delete(fromConn); fromConn.send({type:'auth_success'});
+      _completeJoin(fromConn,pending.name,pending.color,pending.avatar,pending.role);
+    } else {
+      const left=3-pending.attempts;
+      if(left<=0){ pendingAuthConns.delete(fromConn); fromConn.send({type:'kick',banType:'authfail'}); setTimeout(()=>fromConn.close(),200); }
+      else fromConn.send({type:'auth_fail',attemptsLeft:left});
+    }
+
+  } else if(data.type==='auth_success'){  authPending=false; pushMsg({name:'server',message:'authenticated successfully'});
+  } else if(data.type==='auth_required'){ authPending=true;  pushMsg({name:'server',message:'this username has a password — /login <password> to continue'});
+  } else if(data.type==='auth_fail'){     pushMsg({name:'server',message:'wrong password — '+data.attemptsLeft+' attempt'+(data.attemptsLeft===1?'':'s')+' remaining'});
+  } else if(data.type==='suggest_register'){ pushMsg({name:'server',message:'tip: use /register <password> to protect your username'});
+
+  } else if(data.type==='register'){
+    if(!isHost) return;
+    const sn=clientConnNames.get(fromConn); if(!sn) return;
+    roomPasswords[sn]=data.hash; savePasswords(roomIdStr);
+    fromConn.send({type:'register_ack'});
+  } else if(data.type==='register_ack'){ pushMsg({name:'server',message:'password registered'});
+
+  } else if(data.type==='user_leave'){
+    if(isHost){ const sn=clientConnNames.get(fromConn); if(sn!==data.name) return; }
+    if(users[data.name]) users[data.name].online=false;
+    pushMsg({name:'server',message:data.name+' left'});
+    if(isHost) broadcastToClients(data,fromConn);
+
+  } else if(data.type==='kick'){
+    if(isHost) return;
+    const reason=data.banType==='ban'      ?'You were permanently banned from this room.'  :
+                 data.banType==='remove'   ?'You were removed from this room this session.' :
+                 data.banType==='version'  ?'Version mismatch: room is v'+data.ourVersion+', you are v'+data.theirVersion+'.' :
+                 data.banType==='nameclash'?'Username already taken in this room.'          :
+                 data.banType==='authfail' ?'Too many failed login attempts.'               :
+                                            'You were kicked from this room.';
+    pushMsg({name:'server',message:reason}); setTimeout(()=>resetToSetup(),1500);
+
+  } else if(data.type==='room_end'){   if(isHost) return; pushMsg({name:'server',message:'Host ended the room.'}); setTimeout(()=>resetToSetup(),1500);
+  } else if(data.type==='role_update'){if(isHost) return; if(users[data.name]) users[data.name].role=data.role;
+
+  } else if(data.type==='mod_action'){
+    if(!isHost) return;
+    const actorName=clientConnNames.get(fromConn);
+    if(!actorName||actorName!==data.actor) return;
+    const ar=userRank(actorName), tr=userRank(data.target);
+    if(ar<=tr) return;
+    const act=data.action;
+    if(act==='kick'        &&ar>=2) doKick(data.target);
+    else if(act==='remove' &&ar>=2) doRemove(data.target);
+    else if(act==='mute'   &&ar>=2) doMute(data.target);
+    else if(act==='unmute' &&ar>=2) doUnmute(data.target);
+    else if(act==='ban'    &&ar>=3) doBan(data.target);
+    else if(act==='pardon' &&ar>=3) doPardon(data.target);
+    else if(act==='grant'){ const needed=(data.roleArg==='op'||data.roleArg==='tempop')?4:3; if(ar>=needed) doGrantRole(data.target,data.roleArg); }
+    else if(act==='revoke'){ const needed=(tr>=3)?4:3; if(ar>=needed) doRevokeRole(data.target); }
+
+  } else if(data.type==='init'){
+    if(isHost) return;
+    if(data.version!==undefined&&data.version!==VERSION) pushMsg({name:'server',message:'warning: room is v'+data.version+', you are v'+VERSION});
+    history.length=0; data.history.forEach(m=>pushMsg(m));
+    Object.assign(users,data.users); Object.keys(data.users).forEach(n=>invalidateAvatarCache(n));
+    if(data.hostName) hostUsername=data.hostName;
+
+  } else if(data.type==='become_host'){
+    if(isHost) return;
+    const origId=data.roomId;
+    history.length=0; data.history.forEach(m=>pushMsg(m));
+    Object.assign(users,data.users);
+    persistentOps=new Set(data.persistentOps||[]); persistentMods=new Set(data.persistentMods||[]);
+    sessionOps=new Set(data.sessionOps||[]);       sessionMods=new Set(data.sessionMods||[]);
+    roomPasswords=data.passwords||{};
+    if(hostConn){try{hostConn.close();}catch(e){} hostConn=null;}
+    clientConns=[]; clientConnNames=new Map();
+    if(peer){peer.destroy();peer=null;}
+    function _claimHost(id){
+      peer=new Peer(id,{debug:0});
+      peer.on('open',rid=>{ isHost=true; hostUsername=username; roomIdStr=rid; setupHostListeners(); roomBarStr=rid+'  |  host  |  '+username; pushMsg({name:'server',message:'You are now the host.'+(rid!==origId?' (new ID: '+rid+')':'')}); });
+      peer.on('error',e=>{ if(e.type==='unavailable-id'&&id===origId) setTimeout(()=>_claimHost(undefined),400); });
+    }
+    setTimeout(()=>_claimHost(origId),350);
+
+  } else if(data.type==='new_host'){
+    if(isHost) return;
+    hostUsername=data.name; pushMsg({name:'server',message:data.name+' is now the host.'});
+    if(hostConn){try{hostConn.close();}catch(e){} hostConn=null;}
+    roomIdStr=data.peerId;
+    setTimeout(()=>{
+      const nc=peer.connect(data.peerId,{reliable:true}); hostConn=nc;
+      nc.on('open',()=>{ nc.send({type:'user_info',name:username,color:users[username].color,avatar:fAvatar,role:userRole(username),version:VERSION}); roomBarStr=data.peerId+'  |  connected  |  '+username; });
+      nc.on('data',  d=>handleIncoming(d,null));
+      nc.on('close',()=>{ if(appState==='chat') pushMsg({name:'server',message:'disconnected from host.'}); });
+      nc.on('error', e=>console.warn('reconnect err',e));
+    },1400);
+
+  } else if(data.type==='whisper'){
+    if(isHost&&data.to!==username){ const sn=clientConnNames.get(fromConn); if(sn) data.from=sn; const c=connForName(data.to); if(c&&c.open) c.send(data); }
+    else pushMsg({type:'whisper',from:data.from,to:data.to,message:data.message});
+
+  } else if(data.type==='delete_msg'){
+    if(isHost){ const sn=clientConnNames.get(fromConn); if(!sn) return; if(data.name!==sn&&userRank(sn)<2) return; if(data.name!==sn&&userRank(sn)<=userRank(data.name)) return; }
+    for(let i=history.length-1;i>=0;i--){ const m=history[i]; if(m.name===data.name&&m.message===data.message&&m.type===undefined){ history.splice(i,1); break; } }
+    if(isHost) broadcastToClients(data,fromConn);
+
+  } else if(data.type==='edit_msg'){
+    if(isHost){ const sn=clientConnNames.get(fromConn); if(!sn) return; if(data.name!==sn&&userRank(sn)<3) return; if(data.name!==sn&&userRank(sn)<=userRank(data.name)) return; }
+    for(let i=history.length-1;i>=0;i--){ const m=history[i]; if(m.name===data.name&&m.message===data.oldMsg&&m.type===undefined){ m.message=data.newMsg; break; } }
+    if(isHost) broadcastToClients(data,fromConn);
+
+  } else if(data.type==='mute_update'){ if(isHost) return; if(users[data.name]) users[data.name].muted=data.muted;
+  } else if(data.type==='muted'){       if(isHost) return; pushMsg({name:'server',message:data.muted?'You have been muted.':'You have been unmuted.'});
+  } else if(data.type==='clear_chat'){  if(isHost) return; history.length=0; pushMsg({name:'server',message:'Chat was cleared by the host.'});
+  }
+}
+
+// ================================================================
+//  HOST LISTENERS
+// ================================================================
+function setupHostListeners(){
+  peer.on('connection',conn=>{
+    if(!isHost){conn.close();return;}
+    conn.on('open',()=>{ clientConns.push(conn); });
+    conn.on('data',  d=>handleIncoming(d,conn));
+    conn.on('close',()=>{
+      if(!isHost) return;
+      clientConns=clientConns.filter(c=>c!==conn);
+      pendingAuthConns.delete(conn);
+      const name=clientConnNames.get(conn); clientConnNames.delete(conn);
+      if(name&&users[name]&&users[name].online){
+        users[name].online=false;
+        const lm=name+' left'; pushMsg({name:'server',message:lm});
+        broadcastToClients({type:'user_leave',name},null);
+      }
+    });
+    conn.on('error',e=>console.warn('[host]',e));
+  });
+}
+
+// ================================================================
+//  KICK / REMOVE / BAN / PARDON / MUTE
+// ================================================================
+function _dispatchKick(name,banType){
+  const conn=connForName(name);
+  if(conn&&conn.open){conn.send({type:'kick',banType});setTimeout(()=>conn.close(),200);}
+  if(users[name]) users[name].online=false;
+  const lbl=banType==='ban'?'banned':banType==='remove'?'removed':'kicked';
+  const km=name+' was '+lbl;
+  pushMsg({name:'server',message:km});
+  broadcastToClients({type:'message',name:'server',message:km},conn);
+  broadcastToClients({type:'user_leave',name},conn);
+}
+function doKick(n)   { _dispatchKick(n,'kick'); }
+function doRemove(n) { removedNames.add(n); _dispatchKick(n,'remove'); }
+function doBan(n)    { _silentClearRole(n); permanentBans.add(n); removedNames.add(n); savePermanentBans(); _dispatchKick(n,'ban'); }
+function doPardon(n) {
+  removedNames.delete(n); permanentBans.delete(n); savePermanentBans();
+  const pm=n+' was pardoned'; pushMsg({name:'server',message:pm});
+  broadcastToClients({type:'message',name:'server',message:pm},null);
+}
+function doMute(n) {
+  mutedNames.add(n); if(users[n]) users[n].muted=true;
+  const mm=n+' was muted'; pushMsg({name:'server',message:mm});
+  broadcastToClients({type:'mute_update',name:n,muted:true},null);
+  broadcastToClients({type:'message',name:'server',message:mm},null);
+  const c=connForName(n); if(c&&c.open) c.send({type:'muted',muted:true});
+}
+function doUnmute(n) {
+  mutedNames.delete(n); if(users[n]) users[n].muted=false;
+  const mm=n+' was unmuted'; pushMsg({name:'server',message:mm});
+  broadcastToClients({type:'mute_update',name:n,muted:false},null);
+  broadcastToClients({type:'message',name:'server',message:mm},null);
+  const c=connForName(n); if(c&&c.open) c.send({type:'muted',muted:false});
+}
+
+// ================================================================
+//  PENDING CONFIRM / TRANSFER / CLEAR
+// ================================================================
+let pendingConfirm=null;
+function confirmOrExecute(cmd,name,fn){
+  if(pendingConfirm?.cmd===cmd&&pendingConfirm?.name===name){ pendingConfirm=null; fn(); }
+  else { pendingConfirm={cmd,name}; pushMsg({name:'server',message:'type /'+cmd+' '+name+' again to confirm'}); }
+}
+function doTransferHost(name){
+  const conn=connForName(name); pendingConfirm=null;
+  if(!conn||!conn.open) return;
+  const origId=roomIdStr;
+  conn.send({type:'become_host',history:JSON.parse(JSON.stringify(history)),users:JSON.parse(JSON.stringify(users)),
+    roomId:origId,persistentOps:[...persistentOps],persistentMods:[...persistentMods],
+    sessionOps:[...sessionOps],sessionMods:[...sessionMods],passwords:JSON.parse(JSON.stringify(roomPasswords))});
+  broadcastToClients({type:'new_host',peerId:origId,name},conn);
+  pushMsg({name:'server',message:'Host transferred to '+name});
+  isHost=false; hostUsername=name; clientConns=[]; clientConnNames=new Map();
+  if(peer){peer.destroy();peer=null;}
+  setTimeout(()=>{
+    peer=new Peer(undefined,{debug:0});
+    peer.on('open',()=>{
+      const nc=peer.connect(origId,{reliable:true}); hostConn=nc; roomIdStr=origId;
+      nc.on('open',()=>{ nc.send({type:'user_info',name:username,color:users[username].color,avatar:fAvatar,version:VERSION}); roomBarStr=origId+'  |  connected  |  '+username; });
+      nc.on('data',  d=>handleIncoming(d,null));
+      nc.on('close',()=>{ if(appState==='chat') pushMsg({name:'server',message:'disconnected from host.'}); });
+      nc.on('error', e=>console.warn('xfer reconnect',e));
+    });
+  },1200);
+}
+function doClearChat(){ history.length=0; scrollOffset=0; pushMsg({name:'server',message:'Chat cleared.'}); broadcastToClients({type:'clear_chat'},null); }
+function doDeleteLast(name){
+  for(let i=history.length-1;i>=0;i--){
+    const m=history[i];
+    if(m.name===name&&m.type===undefined){
+      const msg=m.message; history.splice(i,1);
+      const pkt={type:'delete_msg',name,message:msg};
+      if(isHost) broadcastToClients(pkt,null); else if(hostConn&&hostConn.open) hostConn.send(pkt);
+      return true;
+    }
+  }
+  return false;
+}
+function doEditLast(name,newText){
+  for(let i=history.length-1;i>=0;i--){
+    const m=history[i];
+    if(m.name===name&&m.type===undefined){
+      const oldMsg=m.message; m.message=newText;
+      const pkt={type:'edit_msg',name,oldMsg,newMsg:newText};
+      if(isHost) broadcastToClients(pkt,null); else if(hostConn&&hostConn.open) hostConn.send(pkt);
+      return true;
+    }
+  }
+  return false;
+}
+
+// ================================================================
+//  HISTORY / SCROLL
+// ================================================================
+const HISTORY_LIMIT=200;
+function pushMsg(msg){
+  if(!msg.ts) msg.ts=Date.now();
+  const atBottom=scrollOffset===0;
+  history.push(msg);
+  if(history.length>HISTORY_LIMIT) history.splice(0,history.length-HISTORY_LIMIT);
+  if(!atBottom){ scrollOffset+=PADY; clampScroll(); }
+}
+
+let scrollOffset=0, linkRegions=[];
+function chatAreaH(){ return MAXY-TBOXY-PADY; }
+function getMaxScroll(){ return max(0,history.length*PADY-chatAreaH()); }
+function clampScroll(){ scrollOffset=constrain(scrollOffset,0,getMaxScroll()); }
+function mouseWheel(event){ if(appState!=='chat') return; scrollOffset=constrain(scrollOffset-event.delta,0,getMaxScroll()); return false; }
+
+// ================================================================
+//  AVATAR
+// ================================================================
+const AV_PALETTE=['ERASE',null,'#f0f0f0','#888888','#111111','#e05050','#e09030','#d4c830','#50b050','#40b8c0','#5060d0','#9050c8'];
+let fAvatar=null, avPalIdx=1, avatarGfxCache={};
+
+function initAvatarDefault(){ fAvatar=new Array(64).fill(resolvedColor('preview')); }
+function getAvPaintColor(){ const p=AV_PALETTE[avPalIdx]; return p==='ERASE'?'':p===null?resolvedColor('preview'):p; }
+function invalidateAvatarCache(name){ delete avatarGfxCache[name]; }
+function getAvatarGfx(name){
+  const av=users[name]?.avatar;
+  if(!av||!av.some(c=>c)) return null;
+  const hash=av.join('|');
+  if(avatarGfxCache[name]?.hash===hash) return avatarGfxCache[name].pg;
+  const pg=createGraphics(8,8); pg.noStroke(); pg.clear();
+  for(let r=0;r<8;r++) for(let c=0;c<8;c++){ const col=av[r*8+c]; if(col){pg.fill(col);pg.rect(c,r,1,1);} }
+  avatarGfxCache[name]={pg,hash}; return pg;
+}
+function paintAvatarCell(mx,my,gx,gy){
+  const c=floor((mx-gx)/AV_CS), r=floor((my-gy)/AV_CS);
+  if(c<0||c>7||r<0||r>7) return;
+  if(!fAvatar) initAvatarDefault();
+  fAvatar[r*8+c]=mouseButton===RIGHT?'':getAvPaintColor();
+  saveProfile();
+}
+
+// ================================================================
+//  LOCALSTORAGE
+// ================================================================
+function saveProfile(){ try{ localStorage.setItem('profile',JSON.stringify({uname:fUname,color:fColor,avatar:fAvatar})); }catch(e){} }
+function loadProfile(){ try{ const p=JSON.parse(localStorage.getItem('profile')||'null'); if(p){fUname=p.uname||'';fColor=p.color||'';fAvatar=Array.isArray(p.avatar)&&p.avatar.length===64?p.avatar:null;} }catch(e){} }
+function saveRoomHistory(rid){ try{ localStorage.setItem('room:'+rid,JSON.stringify(history.filter(m=>m.type!=='_hr'&&m.type!=='_help'))); }catch(e){} }
+function loadRoomHistory(rid){ try{ const s=JSON.parse(localStorage.getItem('room:'+rid)||'null'); if(Array.isArray(s)&&s.length>0){history.length=0;s.forEach(m=>pushMsg(m));return true;} }catch(e){} return false; }
+function loadCreatedRooms(){ try{return JSON.parse(localStorage.getItem('rooms:created')||'[]');}catch(e){return[];} }
+function loadJoinedRooms() { try{return JSON.parse(localStorage.getItem('rooms:joined') ||'[]');}catch(e){return[];} }
+function saveCreatedRoom(id,rname){ try{ let l=loadCreatedRooms(); const i=l.findIndex(r=>r.id===id), e={id,rname:rname||id,ts:Date.now()}; if(i>=0)l[i]=e;else l.unshift(e); localStorage.setItem('rooms:created',JSON.stringify(l.slice(0,10))); }catch(e){} }
+function saveJoinedRoom(id){ try{ let l=loadJoinedRooms(); const i=l.findIndex(r=>r.id===id), e={id,ts:Date.now()}; if(i>=0)l[i]=e;else l.unshift(e); localStorage.setItem('rooms:joined',JSON.stringify(l.slice(0,10))); }catch(e){} }
+function deleteCreatedRoom(id){ try{ localStorage.setItem('rooms:created',JSON.stringify(loadCreatedRooms().filter(r=>r.id!==id))); }catch(e){} }
+function deleteJoinedRoom(id){  try{ localStorage.setItem('rooms:joined', JSON.stringify(loadJoinedRooms().filter(r=>r.id!==id)));  }catch(e){} }
+
+// ================================================================
+//  PING
+// ================================================================
+let pingPeer=null, roomStatuses={}, pingTimers={};
+function stopPinging(){ Object.values(pingTimers).forEach(t=>clearTimeout(t)); pingTimers={}; if(pingPeer){try{pingPeer.destroy();}catch(e){} pingPeer=null;} }
+function startPinging(ids){
+  stopPinging(); roomStatuses={};
+  if(!ids||!ids.length) return;
+  ids.forEach(id=>roomStatuses[id]='checking');
+  pingPeer=new Peer(undefined,{debug:0});
+  pingPeer.on('open',()=>{
+    ids.forEach(id=>{
+      try{
+        const c=pingPeer.connect(id,{reliable:false});
+        pingTimers[id]=setTimeout(()=>{ if(roomStatuses[id]==='checking') roomStatuses[id]='offline'; },4000);
+        c.on('open', ()=>{ clearTimeout(pingTimers[id]); roomStatuses[id]='online';  try{c.close();}catch(e){} });
+        c.on('error',()=>{ clearTimeout(pingTimers[id]); roomStatuses[id]='offline'; });
+      }catch(e){ roomStatuses[id]='offline'; }
+    });
+  });
+  pingPeer.on('error',()=>{ ids.forEach(id=>{ if(roomStatuses[id]==='checking') roomStatuses[id]='offline'; }); });
+}
+function startPingingForMode(mode){ const r=mode==='create'?loadCreatedRooms():loadJoinedRooms(); startPinging(r.map(r=>r.id)); }
+
+// ================================================================
+//  UI STATE
+// ================================================================
+let appState='setup', setupMode=null, focusField='rname';
+let fUname='', fRname='', fJroom='', fColor='';
+let statusTxt='', statusType='n';
+let roomIdStr='', copyLabel='copy ID', roomBarStr='';
+let onlinePanelOpen=false;
+
+function setStatus(msg,isErr,isOk){ statusTxt=msg; statusType=isErr?'e':isOk?'o':'n'; }
+function resetToSetup(){
+  if(peer){peer.destroy();peer=null;}
+  stopPinging();
+  hostConn=null; clientConns=[]; clientConnNames=new Map();
+  removedNames=new Set(); isHost=false; hostUsername=''; mutedNames=new Set();
+  clearRoleSets(); roomPasswords={}; pendingAuthConns=new Map(); authPending=false;
+  history.length=0; pushMsg({name:'server',message:'Welcome!'});
+  users={server:{color:'gray'}};
+  roomBarStr=''; roomIdStr=''; copyLabel='copy ID';
+  setupMode=null; appState='setup'; onlinePanelOpen=false; pendingConfirm=null;
+  scrollOffset=0; setStatus('');
+}
+
+// ================================================================
+//  APP STATE
 // ================================================================
 let frame=0, working_text='', username='placeholder';
-let urlHitAreas=[]; // [{x,y,w,h,url}] rebuilt each draw frame, in canvas coords
-let cursorPos=0;
-let undoStack=[], redoStack=[], undoDirty=false;
+let cursorPos=0, undoStack=[], redoStack=[], undoDirty=false;
 let consoleHistory=[], consoleHistIdx=-1, consoleSaved='';
 function undoSnapshot(){ undoStack.push({text:working_text,pos:cursorPos}); redoStack=[]; if(undoStack.length>200) undoStack.shift(); undoDirty=false; }
-function inputSet(text,pos){ working_text=text; cursorPos=pos===undefined?text.length:pos; undoDirty=true; }
+function inputSet(t,p){ working_text=t; cursorPos=p===undefined?t.length:p; undoDirty=true; }
 function inputInsert(ch){ undoDirty=true; working_text=working_text.slice(0,cursorPos)+ch+working_text.slice(cursorPos); cursorPos+=ch.length; }
 function inputBackspace(){ if(cursorPos===0)return; undoDirty=true; working_text=working_text.slice(0,cursorPos-1)+working_text.slice(cursorPos); cursorPos--; }
-let _heldKey='', _heldCode=0, _heldTimer=0;
-const _HOLD_DELAY=22, _HOLD_REPEAT=3;
 let users={server:{color:'gray'}};
 let history=[{name:'server',message:'Welcome!'}];
+const URL_RE=/https?:\/\/\S+/g;
 
-const URL_RE = /https?:\/\/\S+/g;
-
-// Split text into [{text,isUrl}] segments
 function splitUrls(str){
   const segs=[]; let last=0;
   for(const m of str.matchAll(URL_RE)){
     if(m.index>last) segs.push({text:str.slice(last,m.index),isUrl:false});
-    segs.push({text:m[0],isUrl:true});
-    last=m.index+m[0].length;
+    segs.push({text:m[0],isUrl:true}); last=m.index+m[0].length;
   }
   if(last<str.length) segs.push({text:str.slice(last),isUrl:false});
   return segs.length?segs:[{text:str,isUrl:false}];
 }
-
-// Draw segments from x, recording link regions (baseline y in translated space)
-function drawSegments(segs,x,baselineY,msgCol){
+function drawSegments(segs,x,by,msgCol){
   textSize(12); textAlign(LEFT,BASELINE);
   for(const s of segs){
     const w=textWidth(s.text);
     if(s.isUrl){
-      fill(color(90,160,230));
-      text(s.text,x,baselineY);
-      stroke(color(90,160,230)); strokeWeight(0.5);
-      line(x,baselineY+1,x+w,baselineY+1); noStroke();
-      // store in canvas coords (translateY=HEADER_H applied by caller)
-      linkRegions.push({url:s.text,x,y:baselineY-PADY+3,w,h:PADY});
-    } else {
-      fill(msgCol);
-      text(s.text,x,baselineY);
-    }
+      fill(color(90,160,230)); text(s.text,x,by);
+      stroke(color(90,160,230)); strokeWeight(0.5); line(x,by+1,x+w,by+1); noStroke();
+      linkRegions.push({url:s.text,x,y:by-PADY+3,w,h:PADY});
+    } else { fill(msgCol); text(s.text,x,by); }
     x+=w;
   }
   return x;
@@ -678,19 +619,11 @@ function renderText(txt,y){
   } else if(txt.type==='_help'){
     const rc={1:color(120,120,120),2:color(210,165,55),3:color(100,150,210),4:color(55,195,210)};
     noStroke(); fill(180); textSize(11); textAlign(LEFT,BASELINE); text(txt.cmd,MARGX,y-MARGY);
-    fill(100); textSize(10); text(txt.desc,MARGX+190,y-MARGY);
-    fill(rc[txt.reqRank]||color(80)); noStroke(); ellipse(SB_X-6,y-MARGY-4,5,5);
-    return;
+    fill(100); textSize(10); text(txt.desc,MARGX+floor(MAXX*0.35),y-MARGY);
+    fill(rc[txt.reqRank]||color(80)); noStroke(); ellipse(SB_X-6,y-MARGY-4,5,5); return;
   } else { ({name,message}=txt); }
-
   noStroke(); textSize(12); textAlign(LEFT,BASELINE);
-
-  // [HH:MM] prefix
-  if(txt.ts){
-    const d=new Date(txt.ts),hh=String(d.getHours()).padStart(2,'0'),mm=String(d.getMinutes()).padStart(2,'0');
-    fill(72); text('['+hh+':'+mm+'] ',x,y-MARGY); x+=textWidth('['+hh+':'+mm+'] ');
-  }
-
+  if(txt.ts){ const d=new Date(txt.ts),hh=String(d.getHours()).padStart(2,'0'),mm=String(d.getMinutes()).padStart(2,'0'); fill(72); text('['+hh+':'+mm+'] ',x,y-MARGY); x+=textWidth('['+hh+':'+mm+'] '); }
   const resolvedCol=users[name]?.color||txt.color||'white';
   const resolvedAv=users[name]?.avatar||txt.avatar||null;
   if(name&&(users[name]||txt.color)){
@@ -704,7 +637,6 @@ function renderText(txt,y){
     if(pg){ noSmooth(); image(pg,x,y-MARGY-10,12,12); smooth(); x+=14; }
     else  { fill(resolvedCol); noStroke(); ellipse(x+4,y-MARGY-4,7,7); x+=12; }
   }
-  // prefix (<name>: ) then segmented message body
   if(users[name]||txt.color){
     fill(resolvedCol); textSize(12); textAlign(LEFT,BASELINE);
     const pre='<'+name+'>: '; text(pre,x,y-MARGY); x+=textWidth(pre);
@@ -713,14 +645,26 @@ function renderText(txt,y){
 }
 
 function setup(){
-  createCanvas(MAXX,MAXY+HEADER_H+FOOTER_H);
+  updateLayout();
+  createCanvas(MAXX, MAXY+HEADER_H+FOOTER_H);
   textFont('monospace'); loadProfile(); loadPermanentBans();
 }
+function windowResized(){
+  updateLayout();
+  resizeCanvas(MAXX, MAXY+HEADER_H+FOOTER_H);
+  // invalidate all avatar gfx caches since canvas context may have reset
+  avatarGfxCache={};
+}
+
 function keyPressed(){
   if(appState==='setup') handleSetupKey();
   else{
-    if(keyCode==ENTER){ undoSnapshot(); if(working_text.trim()){ consoleHistory.unshift(working_text); if(consoleHistory.length>200) consoleHistory.pop(); } consoleHistIdx=-1; consoleSaved=''; handleCommand(working_text); working_text=''; cursorPos=0; undoStack=[]; redoStack=[]; }
-    else if(keyCode==BACKSPACE) return; // handled by native listener
+    if(keyCode==ENTER){
+      undoSnapshot();
+      if(working_text.trim()){ consoleHistory.unshift(working_text); if(consoleHistory.length>200) consoleHistory.pop(); }
+      consoleHistIdx=-1; consoleSaved='';
+      handleCommand(working_text); working_text=''; cursorPos=0; undoStack=[]; redoStack=[];
+    }
   }
   return false;
 }
@@ -732,136 +676,82 @@ function mouseDragged(){
 function getCharW(){ textFont('monospace'); textSize(12); return textWidth('M'); }
 
 function drawInput(){
-  const maxW   = SB_X - 2 - MARGX;
+  const maxW=SB_X-2-MARGX;
   textFont('monospace'); textSize(12);
-  const charW  = textWidth('M');
-  const lineLen = Math.floor(maxW / charW);
-  const blink  = Math.floor(frame/30)%2===1;
-
-  // wrap working_text into lines
-  const lines = [];
-  let rem = working_text;
-  while(rem.length > lineLen){ lines.push(rem.slice(0, lineLen)); rem = rem.slice(lineLen); }
+  const charW=textWidth('M'), lineLen=Math.floor(maxW/charW);
+  const blink=Math.floor(frame/30)%2===1;
+  const lines=[]; let rem=working_text;
+  while(rem.length>lineLen){ lines.push(rem.slice(0,lineLen)); rem=rem.slice(lineLen); }
   lines.push(rem);
-
-  const baseY = (MAXY + 1.5*PADY) - TBOXY;
-  noStroke(); textAlign(LEFT, BASELINE);
-
-  for(let i=0; i<lines.length; i++){
-    const y     = baseY - (lines.length - 1 - i) * PADY - MARGY;
-    const start = i * lineLen;
-    const end   = start + lines[i].length;
-
-    fill(200);
-    text(lines[i], MARGX, y);
-
-    // cursor on this line?
-    if(cursorPos >= start && cursorPos <= end){
-      const cx = MARGX + textWidth(lines[i].slice(0, cursorPos - start));
-      if(blink){ fill(200); text('|', cx, y); }
-      else     { stroke(80); strokeWeight(1); line(cx, y, cx, y - PADY + 3); noStroke(); }
+  const baseY=(MAXY+1.5*PADY)-TBOXY;
+  noStroke(); textAlign(LEFT,BASELINE);
+  if(authPending){
+    noStroke(); fill(color(80,55,20,60)); rect(0,baseY-PADY,MAXX,PADY+4);
+    if(!working_text){ fill(color(160,120,50)); textSize(12); textAlign(LEFT,BASELINE); text('/login <password>',MARGX,baseY-MARGY); return; }
+  }
+  for(let i=0;i<lines.length;i++){
+    const y=baseY-(lines.length-1-i)*PADY-MARGY, start=i*lineLen, end=start+lines[i].length;
+    fill(200); text(lines[i],MARGX,y);
+    if(cursorPos>=start&&cursorPos<=end){
+      const cx=MARGX+textWidth(lines[i].slice(0,cursorPos-start));
+      if(blink){ fill(200); text('|',cx,y); }
+      else     { stroke(80); strokeWeight(1); line(cx,y,cx,y-PADY+3); noStroke(); }
     }
   }
 }
 
 function draw(){
   background(50); frame++; cursor(ARROW);
-
   if(appState==='chat'){
     if(roomIdStr&&frame%300===0) saveRoomHistory(roomIdStr);
     if(undoDirty&&frame%300===0) undoSnapshot();
-    clampScroll();
-    linkRegions=[];  // rebuilt by renderText calls below
+    clampScroll(); linkRegions=[];
     drawHeader(); drawFooter();
-
     push(); translate(0,HEADER_H);
-
     drawingContext.save();
     drawingContext.beginPath();
     drawingContext.rect(0,0,MAXX,MAXY);
     drawingContext.clip();
-
     for(let i=0;i<history.length;i++){
       const y=(MAXY-(history.length-1-i)*PADY)-TBOXY+scrollOffset;
-      const baseline=y-MARGY;
-      if(baseline>MAXY+2||baseline<-PADY) continue;
+      if(y-MARGY>MAXY+2||y-MARGY<-PADY) continue;
       renderText(history[i],y);
     }
-
     drawingContext.restore();
-
-    // hover cursor for links (translated space)
-    for(const r of linkRegions){
-      if(mouseX>=r.x&&mouseX<=r.x+r.w&&mouseY-HEADER_H>=r.y&&mouseY-HEADER_H<=r.y+r.h){ cursor(HAND); break; }
-    }
-
+    for(const r of linkRegions){ if(mouseX>=r.x&&mouseX<=r.x+r.w&&mouseY-HEADER_H>=r.y&&mouseY-HEADER_H<=r.y+r.h){ cursor(HAND); break; } }
     drawInput();
-
     const maxS=getMaxScroll();
     if(maxS>0){
-      const areaH=MAXY-10;
-      const thumbH=max(20, areaH*(MAXY/(MAXY+maxS)));
+      const areaH=MAXY-10, thumbH=max(20,areaH*(MAXY/(MAXY+maxS)));
       const thumbT=5+(1-scrollOffset/maxS)*(areaH-thumbH);
       noStroke(); fill(38); rect(SB_X,5,SB_W,areaH,2);
       fill(scrollOffset>0?95:55); rect(SB_X,thumbT,SB_W,thumbH,2);
     }
-
     if(scrollOffset>0){
       const bW=58,bH=16,bX=MAXX/2-bW/2,bY=MAXY-TBOXY-bH-6;
       const hov=mouseX>=bX&&mouseX<=bX+bW&&mouseY-HEADER_H>=bY&&mouseY-HEADER_H<=bY+bH;
       if(hov) cursor(HAND);
       strokeWeight(1); stroke(hov?100:65); fill(hov?color(55,58,68):color(35,38,45));
       rect(bX,bY,bW,bH,3); noStroke();
-      fill(hov?190:120); textSize(10); textAlign(CENTER,CENTER);
-      text('down  latest',bX+bW/2,bY+bH/2);
+      fill(hov?190:120); textSize(10); textAlign(CENTER,CENTER); text('↓  latest',bX+bW/2,bY+bH/2);
     }
-
     pop();
   }
-
   if(appState==='setup') drawSetup();
 }
 
 // ================================================================
 //  SEND & COMMANDS
 // ================================================================
-function wrapMessage(text, name) {
-  const maxW   = SB_X - 2 - MARGX - 14; // 14 = avatar offset
-  const charW  = getCharW();
-  const tsW    = textWidth('[00:00] ');   // fixed-width timestamp prefix
-  const prefix = '<' + name + '>: ';
-  const avail  = maxW - tsW - textWidth(prefix);
-  const lineLen = Math.max(8, Math.floor(avail / charW));
-  if(text.length <= lineLen) return [text];
-  const words = text.split(' ');
-  const lines = [];
-  let line = '';
-  for(const word of words) {
-    if(!line)                                    line = word;
-    else if(line.length+1+word.length <= lineLen) line += ' ' + word;
-    else                                         { lines.push(line); line = word; }
-    while(line.length > lineLen){ lines.push(line.slice(0, lineLen)); line = line.slice(lineLen); }
-  }
-  if(line) lines.push(line);
-  return lines;
+function send(msg,name){
+  if(!msg||!msg.trim()) return;
+  const col=users[name]?.color||null, avatar=users[name]?.avatar||null;
+  pushMsg({name,message:msg.trim(),color:col,avatar});
+  const p={type:'message',name,message:msg.trim(),color:col,avatar};
+  if(isHost) broadcastToClients(p,null);
+  else if(hostConn&&hostConn.open) hostConn.send(p);
 }
-
-function send(msg, name) {
-  if(!msg || !msg.trim()) return;
-  const col    = users[name]?.color  || null;
-  const avatar = users[name]?.avatar || null;
-  for(const line of wrapMessage(msg.trim(), name)) {
-    pushMsg({name, message:line, color:col, avatar});
-    const p = {type:'message', name, message:line, color:col, avatar};
-    if(isHost) broadcastToClients(p, null);
-    else if(hostConn && hostConn.open) hostConn.send(p);
-  }
-}
-function resolveOnlineUser(name){
-  if(!name) return null;
-  const ol=getOnlineList();
-  return (ol.find(u=>u.name===name)||ol.find(u=>u.name.toLowerCase()===name.toLowerCase()))?.name??null;
-}
+function resolveOnlineUser(name){ if(!name) return null; const ol=getOnlineList(); return (ol.find(u=>u.name===name)||ol.find(u=>u.name.toLowerCase()===name.toLowerCase()))?.name??null; }
 function doWhisper(to,message){
   if(to===username){ pushMsg({name:'server',message:"you can't whisper to yourself"}); return; }
   pushMsg({type:'whisper',from:username,to,message});
@@ -879,113 +769,93 @@ function showHelp(rank){
   row('/q  /exit',            'leave or end room',           1);
   row('/e  /edit <new text>', 'edit your last message',      1);
   row('/d  /delete',          'delete your last message',    1);
+  row('/register <password>', 'protect your username',       1);
   row('/bk  /backup',         'download chat backup',        1);
   hr();
   if(rank>=2){
-    row('/d  /delete <n>',    'delete last message of user', 2);
-    row('/mu  /mute <n>',        'mute a user',               2);
-    row('/um  /unmute <n>',      'unmute a user',             2);
-    row('/k  /kick <n>',         'kick (can rejoin)',         2);
-    row('/r  /rem  /remove <n>', 'remove for this session',   2);
+    row('/d <n>',                'delete last msg of user',  2);
+    row('/mu  /mute <n>',        'mute a user',              2);
+    row('/um  /unmute <n>',      'unmute a user',            2);
+    row('/k  /kick <n>',         'kick (can rejoin)',        2);
+    row('/r  /rem  /remove <n>', 'remove for this session',  2);
     hr();
   }
   if(rank>=3){
-    row('/e  /edit <n> <txt>', 'edit last message of user',  3);
-    row('/b  /ban <n>',          'permanent ban',             3);
-    row('/p  /pdn  /pardon <n>', 'pardon a banned user',      3);
-    row('/tm  /tempmod <n>',     'temp mod (this session)',   3);
-    row('/m  /mod <n>',          'make permanent mod',        3);
-    row('/dm  /demod <n>',       'remove mod role',           3);
+    row('/e <n> <txt>',          'edit last msg of user',    3);
+    row('/b  /ban <n>',          'permanent ban',            3);
+    row('/p  /pdn  /pardon <n>', 'pardon a banned user',     3);
+    row('/tm  /tempmod <n>',     'temp mod (this session)',  3);
+    row('/m  /mod <n>',          'permanent mod',            3);
+    row('/dm  /demod <n>',       'remove mod role',          3);
     hr();
   }
   if(rank>=4){
-    row('/to  /tempop <n>',  'temp op (this session)',        4);
-    row('/o  /op <n>',       'make permanent op',             4);
-    row('/do  /deop <n>',    'remove op role',                4);
-    row('/owner <n>',        'transfer ownership',            4);
-    row('/c  /clr  /clear',  'clear chat history',            4);
-    row('/rs  /restore',     'restore chat from file',        4);
-    row('/end',              'end room for everyone',         4);
+    row('/to  /tempop <n>',  'temp op (this session)',       4);
+    row('/o  /op <n>',       'permanent op',                 4);
+    row('/do  /deop <n>',    'remove op role',               4);
+    row('/owner <n>',        'transfer ownership',           4);
+    row('/c  /clr  /clear',  'clear chat history',           4);
+    row('/rs  /restore',     'restore chat from file',       4);
+    row('/end',              'end room for everyone',        4);
     hr();
   }
-
 }
 
 function handleCommand(text){
   if(!text||!text.trim()) return;
+  if(authPending){
+    const parts=text.trim().slice(1).split(/\s+/);
+    if(!text.startsWith('/')||parts[0]?.toLowerCase()!=='login'){ pushMsg({name:'server',message:'you must /login <password> first'}); return; }
+    const pw=parts.slice(1).join(' ');
+    if(!pw){ pushMsg({name:'server',message:'usage: /login <password>'}); return; }
+    hashPassword(pw).then(hash=>{ if(hostConn&&hostConn.open) hostConn.send({type:'auth_attempt',hash}); });
+    return;
+  }
   if(!text.startsWith('/')){ send(text,username); return; }
   const parts=text.trim().slice(1).split(/\s+/);
   const cmd=parts[0].toLowerCase(), arg1=parts[1]||'', rest=parts.slice(2).join(' ');
   const rank=myRank();
-
   function needRank(r,lbl){ if(rank<r){ pushMsg({name:'server',message:'requires '+lbl}); return false; } return true; }
   function resolveTarget(arg){ const t=resolveOnlineUser(arg); if(!t){ pushMsg({name:'server',message:'user not found: '+arg}); return null; } return t; }
   function rankCheck(t,ar){ if(userRank(t)>=ar){ pushMsg({name:'server',message:'cannot target '+t+': outranks you'}); return false; } return true; }
 
-  if(cmd==='mu'||cmd==='mute'){
-    if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('mute',t);
-  } else if(cmd==='um'||cmd==='umu'||cmd==='unmute'){
-    if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; sendOrExecModAction('unmute',t);
-  } else if(cmd==='k'||cmd==='kick'){
-    if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('kick',t);
-  } else if(cmd==='r'||cmd==='rem'||cmd==='remove'){
-    if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('remove',t);
-  } else if(cmd==='b'||cmd==='ban'){
-    if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('ban',t);
-  } else if(cmd==='p'||cmd==='pdn'||cmd==='pardon'){
-    if(!needRank(3,'operator'))return; if(!arg1){pushMsg({name:'server',message:'usage: /pardon <name>'});return;} sendOrExecModAction('pardon',arg1);
-  } else if(cmd==='tm'||cmd==='tempmod'){
-    if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return;
-    confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'tempmod'));
-  } else if(cmd==='m'||cmd==='mod'){
-    if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return;
-    confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'mod'));
-  } else if(cmd==='dm'||cmd==='demod'){
-    if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return;
-    if(userRank(t)!==2){pushMsg({name:'server',message:arg1+' is not a moderator'});return;}
-    confirmOrExecute(cmd,t,()=>sendOrExecModAction('revoke',t,'mod'));
-  } else if(cmd==='to'||cmd==='tempop'){
-    if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return;
-    confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'tempop'));
-  } else if(cmd==='o'||cmd==='op'){
-    if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return;
-    confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'op'));
-  } else if(cmd==='do'||cmd==='deop'){
-    if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return;
-    if(userRank(t)!==3){pushMsg({name:'server',message:arg1+' is not an operator'});return;}
-    confirmOrExecute(cmd,t,()=>sendOrExecModAction('revoke',t,'op'));
-  } else if(cmd==='owner'){
-    if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return;
-    confirmOrExecute(cmd,t,()=>doTransferHost(t));
-  } else if(cmd==='w'||cmd==='whisper'){
-    const t=resolveTarget(arg1);if(!t)return;
-    if(!rest){pushMsg({name:'server',message:'usage: /w <name> <message>'});return;}
-    doWhisper(t,rest);
-  } else if(cmd==='q'||cmd==='quit'||cmd==='exit'||cmd==='nuh'){
-    rank>=4?doEndRoom():doLeave();
-  } else if(cmd==='end'){ if(!needRank(4,'owner'))return; doEndRoom();
+  if(cmd==='login'){ pushMsg({name:'server',message:'already authenticated'});
+  } else if(cmd==='register'){
+    const pw=parts.slice(1).join(' ');
+    if(!pw){ pushMsg({name:'server',message:'usage: /register <password>'}); return; }
+    hashPassword(pw).then(hash=>{
+      if(isHost){ roomPasswords[username]=hash; savePasswords(roomIdStr); pushMsg({name:'server',message:'password registered'}); }
+      else if(hostConn&&hostConn.open) hostConn.send({type:'register',hash});
+    });
+  } else if(cmd==='mu'||cmd==='mute'){       if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('mute',t);
+  } else if(cmd==='um'||cmd==='unmute'){     if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; sendOrExecModAction('unmute',t);
+  } else if(cmd==='k'||cmd==='kick'){        if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('kick',t);
+  } else if(cmd==='r'||cmd==='rem'||cmd==='remove'){ if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('remove',t);
+  } else if(cmd==='b'||cmd==='ban'){         if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; sendOrExecModAction('ban',t);
+  } else if(cmd==='p'||cmd==='pdn'||cmd==='pardon'){ if(!needRank(3,'operator'))return; if(!arg1){pushMsg({name:'server',message:'usage: /pardon <n>'});return;} sendOrExecModAction('pardon',arg1);
+  } else if(cmd==='tm'||cmd==='tempmod'){    if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'tempmod'));
+  } else if(cmd==='m'||cmd==='mod'){         if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'mod'));
+  } else if(cmd==='dm'||cmd==='demod'){      if(!needRank(3,'operator'))return; const t=resolveTarget(arg1);if(!t)return; if(userRank(t)!==2){pushMsg({name:'server',message:arg1+' is not a moderator'});return;} confirmOrExecute(cmd,t,()=>sendOrExecModAction('revoke',t,'mod'));
+  } else if(cmd==='to'||cmd==='tempop'){     if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'tempop'));
+  } else if(cmd==='o'||cmd==='op'){          if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; confirmOrExecute(cmd,t,()=>sendOrExecModAction('grant',t,'op'));
+  } else if(cmd==='do'||cmd==='deop'){       if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return; if(userRank(t)!==3){pushMsg({name:'server',message:arg1+' is not an operator'});return;} confirmOrExecute(cmd,t,()=>sendOrExecModAction('revoke',t,'op'));
+  } else if(cmd==='owner'){                  if(!needRank(4,'owner'))return; const t=resolveTarget(arg1);if(!t)return; confirmOrExecute(cmd,t,()=>doTransferHost(t));
+  } else if(cmd==='w'||cmd==='whisper'){     const t=resolveTarget(arg1);if(!t)return; if(!rest){pushMsg({name:'server',message:'usage: /w <n> <message>'});return;} doWhisper(t,rest);
+  } else if(cmd==='q'||cmd==='quit'||cmd==='exit'){ rank>=4?doEndRoom():doLeave();
+  } else if(cmd==='end'){  if(!needRank(4,'owner'))return; doEndRoom();
   } else if(cmd==='e'||cmd==='edit'){
-    const newText = arg1 ? parts.slice(1).join(' ') : '';
-    if(!newText){ pushMsg({name:'server',message:'usage: /e <new text>  or  /e <name> <new text> (op+)'}); return; }
-    // check if first arg is an online user name (op+ targeted edit)
-    const maybeTarget = resolveOnlineUser(arg1);
-    if(maybeTarget && maybeTarget!==username && parts.length>2){
-      if(!needRank(3,'operator'))return;
-      if(!rankCheck(maybeTarget,rank))return;
-      const editText=parts.slice(2).join(' ');
-      if(!doEditLast(maybeTarget,editText)) pushMsg({name:'server',message:'no messages found for '+maybeTarget});
+    const maybeTarget=resolveOnlineUser(arg1);
+    if(maybeTarget&&maybeTarget!==username&&parts.length>2){
+      if(!needRank(3,'operator'))return; if(!rankCheck(maybeTarget,rank))return;
+      if(!doEditLast(maybeTarget,parts.slice(2).join(' '))) pushMsg({name:'server',message:'no messages found for '+maybeTarget});
     } else {
-      if(!doEditLast(username, newText)) pushMsg({name:'server',message:'nothing to edit'});
+      const newText=parts.slice(1).join(' ');
+      if(!newText){pushMsg({name:'server',message:'usage: /e <new text>'});return;}
+      if(!doEditLast(username,newText)) pushMsg({name:'server',message:'nothing to edit'});
     }
   } else if(cmd==='d'||cmd==='delete'){
-    if(arg1){
-      if(!needRank(2,'moderator'))return;
-      const t=resolveTarget(arg1); if(!t)return;
-      if(!rankCheck(t,rank))return;
-      if(!doDeleteLast(t)) pushMsg({name:'server',message:'no messages found for '+t});
-    } else {
-      if(!doDeleteLast(username)) pushMsg({name:'server',message:'nothing to delete'});
-    }
+    if(arg1){ if(!needRank(2,'moderator'))return; const t=resolveTarget(arg1);if(!t)return; if(!rankCheck(t,rank))return; if(!doDeleteLast(t)) pushMsg({name:'server',message:'no messages found for '+t}); }
+    else    { if(!doDeleteLast(username)) pushMsg({name:'server',message:'nothing to delete'}); }
   } else if(cmd==='c'||cmd==='clr'||cmd==='clear'){ if(!needRank(4,'owner'))return; doClearChat();
   } else if(cmd==='bk'||cmd==='backup'){
     const blob=new Blob([JSON.stringify({history,users},null,2)],{type:'application/json'});
@@ -1064,7 +934,7 @@ function drawAvatarEditor(fx,cy){
     if(pval==='ERASE'){
       strokeWeight(sel?2:0.5); stroke(sel?220:55); fill(18); rect(bx,by,AV_PCW,AV_PCH,1);
       noStroke(); fill(45); rect(bx,by,AV_PCW/2,AV_PCH/2); rect(bx+AV_PCW/2,by+AV_PCH/2,AV_PCW/2,AV_PCH/2);
-      fill(130); textSize(8); textAlign(CENTER,CENTER); text('x',bx+AV_PCW/2,by+AV_PCH/2+1);
+      fill(130); textSize(8); textAlign(CENTER,CENTER); text('×',bx+AV_PCW/2,by+AV_PCH/2+1);
     } else {
       const col=pval===null?resolvedColor('preview'):pval;
       strokeWeight(sel?2:0.5); stroke(sel?220:55); fill(col); rect(bx,by,AV_PCW,AV_PCH,1);
@@ -1094,8 +964,7 @@ function drawRoomList(mode,startCy){
     const delX=fx+SFW-18, delHov=isHov(delX,y+3,14,14);
     if(hov&&!delHov) cursor(HAND);
     strokeWeight(1); stroke(hov?72:42); fill(hov?38:28); rect(fx,y,SFW,20,2); noStroke();
-    fill(st==='online'?color(78,160,78):st==='offline'?color(140,58,58):color(155,140,45));
-    ellipse(fx+12,y+10,7,7);
+    fill(st==='online'?color(78,160,78):st==='offline'?color(140,58,58):color(155,140,45)); ellipse(fx+12,y+10,7,7);
     fill(hov&&!delHov?210:148); textSize(10); textAlign(LEFT,CENTER);
     const lbl=room.rname&&room.rname!==room.id?room.rname:room.id;
     text(lbl.length>34?lbl.slice(0,32)+'..':lbl,fx+22,y+10);
@@ -1103,7 +972,7 @@ function drawRoomList(mode,startCy){
     strokeWeight(1); stroke(delHov?color(200,80,80):color(90,40,40));
     fill(delHov?color(80,20,20):color(35,15,15)); rect(delX,y+3,14,14,2);
     noStroke(); fill(delHov?color(230,110,110):color(140,60,60));
-    textSize(11); textAlign(CENTER,CENTER); text('x',delX+7,y+10);
+    textSize(11); textAlign(CENTER,CENTER); text('×',delX+7,y+10);
   }
 }
 
@@ -1157,16 +1026,9 @@ function drawHeader(){
   text(roomBarStr||'not connected',MARGX,HEADER_H/2);
   if(isHost&&roomIdStr){ uiBtn(copyLabel,MAXX-MARGX-52,(HEADER_H-16)/2,52,16); }
 }
-function getOnlineList(){
-  return Object.entries(users).filter(([k,v])=>k!=='server'&&v.online).map(([k,v])=>({name:k,color:v.color}));
-}
+function getOnlineList(){ return Object.entries(users).filter(([k,v])=>k!=='server'&&v.online).map(([k,v])=>({name:k,color:v.color})); }
 function footerBtns(){
-  if(isHost) return [
-    {id:'bk', label:'[bk]',       x:20, w:46},
-    {id:'rs', label:'[rs]',       x:70, w:46},
-    {id:'clr',label:'[clr]',      x:120,w:42,tint:true},
-    {id:'end',label:'[end room]', x:166,w:82},
-  ];
+  if(isHost) return [{id:'bk',label:'[bk]',x:20,w:46},{id:'rs',label:'[rs]',x:70,w:46},{id:'clr',label:'[clr]',x:120,w:42,tint:true},{id:'end',label:'[end room]',x:166,w:82}];
   return [{id:'leave',label:'[leave]',x:20,w:72}];
 }
 function drawFooter(){
@@ -1175,15 +1037,13 @@ function drawFooter(){
   stroke(55); strokeWeight(1); line(0,fy,MAXX,fy); noStroke();
   const by=fy+(FOOTER_H-FB_H)/2;
   for(const b of footerBtns()){ if(b.tint) uiClearBtn(b.x,by,b.w,FB_H); else uiBtn(b.label,b.x,by,b.w,FB_H); }
-
   const ol=getOnlineList(), g=onlinePanelGeom(ol,fy);
   const obW=76, obx=MAXX-MARGX-obW;
   if(isHov(obx,by,obW,FB_H)) cursor(HAND);
   uiBtn(ol.length+' online',obx,by,obW,FB_H,onlinePanelOpen);
-
   if(onlinePanelOpen&&(ol.length>0||g.hasBlocked)){
     strokeWeight(1); stroke(65); fill(24); rect(g.panelX,g.panelY,g.panelW,g.panelH,3); noStroke();
-    const bH=14, bBX=g.panelX+g.panelW-4-14, bRX=bBX-2-14, bKX=bRX-2-14, bHX=bKX-2-14, bOX=bHX-2-14, bMX=bOX-2-14, bMUX=bMX-2-14;
+    const bH=14,bBX=g.panelX+g.panelW-4-14,bRX=bBX-2-14,bKX=bRX-2-14,bHX=bKX-2-14,bOX=bHX-2-14,bMX=bOX-2-14,bMUX=bMX-2-14;
     for(let i=0;i<ol.length;i++){
       const u=ol[i], ry=g.panelY+g.padY+i*g.rowH;
       const confOwner=isHost&&pendingConfirm?.cmd==='owner'&&pendingConfirm?.name===u.name;
@@ -1198,12 +1058,13 @@ function drawFooter(){
       let nameX=g.panelX+g.padX+18;
       const badge=getRoleBadge(u.name);
       if(badge){ fill(color(...badge.c)); textSize(9); textAlign(LEFT,TOP); text(badge.l,nameX,ry+3); nameX+=badge.l.length>3?30:24; }
+      if(isHost&&roomPasswords[u.name]){ fill(130); textSize(9); textAlign(LEFT,TOP); text('🔒',nameX,ry+2); nameX+=14; }
       fill(190); textSize(11); textAlign(LEFT,TOP);
       const rightBtnsW=isHost&&u.name!==username?4+14+2+14+2+14+2+14+2+14+2+14+2+14:4;
       const maxChars=max(4,floor((g.panelX+g.panelW-rightBtnsW-nameX)/7));
-      text(u.name.length>maxChars?u.name.slice(0,maxChars-1)+'...':u.name,nameX,ry+2);
+      text(u.name.length>maxChars?u.name.slice(0,maxChars-1)+'…':u.name,nameX,ry+2);
       if(isHost&&u.name!==username){
-        const isMuted=isHost?mutedNames.has(u.name):!!(users[u.name]?.muted);
+        const isMuted=mutedNames.has(u.name);
         uiMuteBtn(isMuted?'UM':'MU',bMUX,ry+3,14,bH,isMuted);
         uiModBtn ('M',bMX,ry+3,14,bH,confMod);
         uiOpBtn  ('O',bOX,ry+3,14,bH,confOp);
@@ -1248,7 +1109,6 @@ function doubleClicked(){
     if(l) for(const {room,y} of l.rows) if(isHov(fx,y,SFW-18,20)){ fJroom=room.id; doJoinRoom(); return; }
   }
 }
-
 function handleSetupClick(){
   const cx=MAXX/2, fx=cx-SFW/2;
   const mb1x=cx-117, mb2x=cx-37, mb3x=cx+43;
@@ -1290,18 +1150,10 @@ function handleSetupClick(){
     if(isHov(gx+57,btnY,53,18)){fAvatar=new Array(64).fill('');saveProfile();return;}
   }
 }
-
 function handleChatClick(){
-  // links (translated space — subtract HEADER_H)
   const cy=mouseY-HEADER_H;
-  for(const r of linkRegions){
-    if(mouseX>=r.x&&mouseX<=r.x+r.w&&cy>=r.y&&cy<=r.y+r.h){
-      window.open(r.url,'_blank','noopener,noreferrer'); return;
-    }
-  }
-
+  for(const r of linkRegions){ if(mouseX>=r.x&&mouseX<=r.x+r.w&&cy>=r.y&&cy<=r.y+r.h){ window.open(r.url,'_blank','noopener,noreferrer'); return; } }
   const fy=MAXY+HEADER_H, by=fy+(FOOTER_H-FB_H)/2;
-
   if(isHost&&roomIdStr&&isHov(MAXX-MARGX-52,(HEADER_H-16)/2,52,16)){
     navigator.clipboard.writeText(roomIdStr).then(()=>{copyLabel='Copied!';setTimeout(()=>{copyLabel='copy ID';},2000);}); return;
   }
@@ -1314,14 +1166,10 @@ function handleChatClick(){
     else if(b.id==='leave') doLeave();
     return;
   }
-
   if(scrollOffset>0){
     const bW=58,bH=16,bX=MAXX/2-bW/2,bY=MAXY-TBOXY-bH-6;
-    if(mouseX>=bX&&mouseX<=bX+bW&&mouseY-HEADER_H>=bY&&mouseY-HEADER_H<=bY+bH){
-      scrollOffset=0; return;
-    }
+    if(mouseX>=bX&&mouseX<=bX+bW&&mouseY-HEADER_H>=bY&&mouseY-HEADER_H<=bY+bH){ scrollOffset=0; return; }
   }
-
   const obW=76, obx=MAXX-MARGX-obW;
   if(isHov(obx,by,obW,FB_H)){onlinePanelOpen=!onlinePanelOpen;pendingConfirm=null;return;}
   if(onlinePanelOpen){
@@ -1332,56 +1180,19 @@ function handleChatClick(){
         for(let i=0;i<ol.length;i++){
           const u=ol[i]; if(u.name===username) continue;
           const ry=g.panelY+g.padY+i*g.rowH;
-          if(isHov(bMUX,ry+3,14,bH)){
-            mutedNames.has(u.name)?doUnmute(u.name):doMute(u.name); pendingConfirm=null; return;
-          }
-          if(isHov(bMX,ry+3,14,bH)){
-            if(pendingConfirm?.cmd==='mod'&&pendingConfirm?.name===u.name){
-              pendingConfirm=null;
-              userRank(u.name)===2?sendOrExecModAction('revoke',u.name):sendOrExecModAction('grant',u.name,'mod');
-            } else pendingConfirm={cmd:'mod',name:u.name};
-            return;
-          }
-          if(isHov(bOX,ry+3,14,bH)){
-            if(pendingConfirm?.cmd==='op'&&pendingConfirm?.name===u.name){
-              pendingConfirm=null;
-              userRank(u.name)===3?sendOrExecModAction('revoke',u.name):sendOrExecModAction('grant',u.name,'op');
-            } else pendingConfirm={cmd:'op',name:u.name};
-            return;
-          }
+          if(isHov(bMUX,ry+3,14,bH)){ mutedNames.has(u.name)?doUnmute(u.name):doMute(u.name); pendingConfirm=null; return; }
+          if(isHov(bMX,ry+3,14,bH)){ if(pendingConfirm?.cmd==='mod'&&pendingConfirm?.name===u.name){ pendingConfirm=null; userRank(u.name)===2?sendOrExecModAction('revoke',u.name):sendOrExecModAction('grant',u.name,'mod'); } else pendingConfirm={cmd:'mod',name:u.name}; return; }
+          if(isHov(bOX,ry+3,14,bH)){ if(pendingConfirm?.cmd==='op'&&pendingConfirm?.name===u.name){ pendingConfirm=null; userRank(u.name)===3?sendOrExecModAction('revoke',u.name):sendOrExecModAction('grant',u.name,'op'); } else pendingConfirm={cmd:'op',name:u.name}; return; }
           if(isHov(bHX,ry+3,14,bH)){ if(pendingConfirm?.cmd==='owner'&&pendingConfirm?.name===u.name){pendingConfirm=null;doTransferHost(u.name);}else pendingConfirm={cmd:'owner',name:u.name}; return; }
           if(isHov(bKX,ry+3,14,bH)){doKick(u.name);   pendingConfirm=null;return;}
           if(isHov(bRX,ry+3,14,bH)){doRemove(u.name); pendingConfirm=null;return;}
           if(isHov(bBX,ry+3,14,bH)){doBan(u.name);    pendingConfirm=null;return;}
         }
-        if(g.hasBlocked){
-          const pdnW=22,pdnX=g.panelX+g.panelW-4-pdnW;
-          for(let i=0;i<g.bl.length;i++){
-            const ry=g.blockedBaseY+i*g.rowH;
-            if(isHov(pdnX,ry+3,pdnW,14)){doPardon(g.bl[i].name);return;}
-          }
-        }
+        if(g.hasBlocked){ const pdnW=22,pdnX=g.panelX+g.panelW-4-pdnW; for(let i=0;i<g.bl.length;i++){ const ry=g.blockedBaseY+i*g.rowH; if(isHov(pdnX,ry+3,pdnW,14)){doPardon(g.bl[i].name);return;} } }
       }
       return;
     }
     onlinePanelOpen=false; pendingConfirm=null;
-  }
-
-  // click on a message to copy it (chat body only, not input row)
-  const chatMY = mouseY - HEADER_H;
-  if(chatMY >= 0 && chatMY < MAXY - PADY*2){
-    for(let i=0; i<history.length; i++){
-      const m = history[i];
-      if(!m || m.type==='_hr' || m.type==='_help') continue;
-      const y = (MAXY-(history.length-1-i)*PADY)-TBOXY+scrollOffset - MARGY;
-      if(chatMY >= y-PADY && chatMY < y+4){
-        const txt = m.type==='whisper'
-          ? '['+m.from+'>'+m.to+']: '+m.message
-          : (m.name ? '<'+m.name+'>: '+m.message : m.message);
-        navigator.clipboard.writeText(txt);
-        return;
-      }
-    }
   }
 }
 
@@ -1389,25 +1200,10 @@ function handleChatClick(){
 //  SETUP KEY HANDLER
 // ================================================================
 function handleSetupKey(){
-  if(keyCode===TAB){
-    const vis=setupMode==='profile'?['uname','color']:setupMode==='create'?['rname']:setupMode==='join'?['jroom']:[];
-    if(vis.length) focusField=vis[(vis.indexOf(focusField)+1)%vis.length]; return;
-  }
-  if(keyCode===ENTER){ if(setupMode==='create')doCreateRoom();else if(setupMode==='join')doJoinRoom(); return; }
-  if(keyCode===BACKSPACE){
-    if(focusField==='uname')fUname=fUname.slice(0,-1);
-    else if(focusField==='rname')fRname=fRname.slice(0,-1);
-    else if(focusField==='jroom')fJroom=fJroom.slice(0,-1);
-    else if(focusField==='color')fColor=fColor.slice(0,-1);
-    if(setupMode==='profile')saveProfile(); return;
-  }
-  if(key.length===1){
-    if(focusField==='uname')fUname+=key;
-    else if(focusField==='rname')fRname+=key;
-    else if(focusField==='jroom')fJroom+=key;
-    else if(focusField==='color')fColor+=key;
-    if(setupMode==='profile')saveProfile();
-  }
+  if(keyCode===TAB){ const vis=setupMode==='profile'?['uname','color']:setupMode==='create'?['rname']:setupMode==='join'?['jroom']:[];if(vis.length)focusField=vis[(vis.indexOf(focusField)+1)%vis.length];return; }
+  if(keyCode===ENTER){ if(setupMode==='create')doCreateRoom();else if(setupMode==='join')doJoinRoom();return; }
+  if(keyCode===BACKSPACE){ if(focusField==='uname')fUname=fUname.slice(0,-1);else if(focusField==='rname')fRname=fRname.slice(0,-1);else if(focusField==='jroom')fJroom=fJroom.slice(0,-1);else if(focusField==='color')fColor=fColor.slice(0,-1);if(setupMode==='profile')saveProfile();return; }
+  if(key.length===1){ if(focusField==='uname')fUname+=key;else if(focusField==='rname')fRname+=key;else if(focusField==='jroom')fJroom+=key;else if(focusField==='color')fColor+=key;if(setupMode==='profile')saveProfile(); }
 }
 
 // ================================================================
@@ -1420,7 +1216,7 @@ function doCreateRoom(){
   peer=new Peer(customId,{debug:0});
   peer.on('open',id=>{
     isHost=true; roomIdStr=id; hostUsername=username;
-    saveCreatedRoom(id,fRname.trim()||id); loadRoles(id);
+    saveCreatedRoom(id,fRname.trim()||id); loadRoles(id); loadPasswords(id);
     const restored=loadRoomHistory(id);
     if(!restored){history.length=0;pushMsg({name:'server',message:'Room created.'});}
     if(!fAvatar) initAvatarDefault();
@@ -1428,10 +1224,7 @@ function doCreateRoom(){
     setupHostListeners();
     roomBarStr=id+'  |  host  |  '+username; appState='chat';
   });
-  peer.on('error',e=>{
-    setStatus(e.type==='unavailable-id'?'"'+customId+'" is taken - try another':'error: '+e.type,true);
-    peer.destroy(); peer=null;
-  });
+  peer.on('error',e=>{ setStatus(e.type==='unavailable-id'?'"'+customId+'" is taken - try another':'error: '+e.type,true); peer.destroy(); peer=null; });
 }
 function doJoinRoom(){
   const uname=fUname.trim(), roomId=fJroom.trim();
@@ -1446,7 +1239,7 @@ function doJoinRoom(){
     conn.on('open',()=>{
       conn.send({type:'user_info',name:username,color:users[username].color,avatar:fAvatar,version:VERSION});
       saveJoinedRoom(roomId); roomIdStr=roomId;
-      roomBarStr=roomId+'  |  connected  |  '+username; appState='chat';
+      roomBarStr=roomId+'  |  connecting  |  '+username; appState='chat';
     });
     conn.on('data',  d=>handleIncoming(d,null));
     conn.on('close',()=>{ if(appState==='chat') pushMsg({name:'server',message:'disconnected from host.'}); });
@@ -1454,60 +1247,41 @@ function doJoinRoom(){
   });
   peer.on('error',e=>setStatus('error: '+e.type,true));
 }
-function doLeave(){
-  if(hostConn&&hostConn.open) hostConn.send({type:'user_leave',name:username});
-  if(roomIdStr) saveRoomHistory(roomIdStr);
-  resetToSetup();
-}
-function doEndRoom(){
-  if(roomIdStr) saveRoomHistory(roomIdStr);
-  broadcastToClients({type:'room_end'},null);
-  resetToSetup();
-}
+function doLeave(){ if(hostConn&&hostConn.open) hostConn.send({type:'user_leave',name:username}); if(roomIdStr) saveRoomHistory(roomIdStr); resetToSetup(); }
+function doEndRoom(){ if(roomIdStr) saveRoomHistory(roomIdStr); broadcastToClients({type:'room_end'},null); resetToSetup(); }
 
-// Native keydown listener — all chat input editing (key repeat + ctrl shortcuts)
-document.addEventListener('keydown', e => {
-  if(appState !== 'chat') return;
-
-  // ctrl shortcuts
-  if(e.ctrlKey || e.metaKey) {
-    if(e.key==='c'){ navigator.clipboard.writeText(working_text); e.preventDefault(); return; }
-    if(e.key==='x'){ undoSnapshot(); navigator.clipboard.writeText(working_text); inputSet('',0); e.preventDefault(); return; }
-    if(e.key==='v'){ undoSnapshot(); navigator.clipboard.readText().then(t=>{ inputInsert(t.replace(/\r?\n/g,' ')); }); e.preventDefault(); return; }
-    if(e.key==='d'){ undoSnapshot(); inputSet('',0); e.preventDefault(); return; }
-    if(e.key==='z'){ e.preventDefault();
-      if(undoStack.length){ redoStack.push({text:working_text,pos:cursorPos}); const s=undoStack.pop(); working_text=s.text; cursorPos=s.pos; undoDirty=false; }
-      return;
-    }
-    if(e.key==='y'){ e.preventDefault();
-      if(redoStack.length){ undoStack.push({text:working_text,pos:cursorPos}); const s=redoStack.pop(); working_text=s.text; cursorPos=s.pos; undoDirty=false; }
-      return;
-    }
-    return; // don't fall through to char insert for other ctrl combos
-  }
-
-  if(e.key==='ArrowLeft') { cursorPos=max(0,cursorPos-1); e.preventDefault(); return; }
-  if(e.key==='ArrowRight'){ cursorPos=min(working_text.length,cursorPos+1); e.preventDefault(); return; }
-  if(e.key==='ArrowUp'){
-    e.preventDefault();
-    if(!consoleHistory.length) return;
-    if(consoleHistIdx===-1) consoleSaved=working_text;
-    consoleHistIdx=min(consoleHistory.length-1, consoleHistIdx+1);
-    inputSet(consoleHistory[consoleHistIdx]);
+// ================================================================
+//  NATIVE KEY LISTENER
+// ================================================================
+document.addEventListener('keydown',e=>{
+  if(appState!=='chat') return;
+  if(e.ctrlKey||e.metaKey){
+    if(e.key==='c'){navigator.clipboard.writeText(working_text);e.preventDefault();return;}
+    if(e.key==='x'){undoSnapshot();navigator.clipboard.writeText(working_text);inputSet('',0);e.preventDefault();return;}
+    if(e.key==='v'){undoSnapshot();navigator.clipboard.readText().then(t=>{inputInsert(t.replace(/\r?\n/g,' '));});e.preventDefault();return;}
+    if(e.key==='d'){undoSnapshot();inputSet('',0);e.preventDefault();return;}
+    if(e.key==='z'){e.preventDefault();if(undoStack.length){redoStack.push({text:working_text,pos:cursorPos});const s=undoStack.pop();working_text=s.text;cursorPos=s.pos;undoDirty=false;}return;}
+    if(e.key==='y'){e.preventDefault();if(redoStack.length){undoStack.push({text:working_text,pos:cursorPos});const s=redoStack.pop();working_text=s.text;cursorPos=s.pos;undoDirty=false;}return;}
     return;
+  }
+  if(e.key==='ArrowLeft') {cursorPos=max(0,cursorPos-1);e.preventDefault();return;}
+  if(e.key==='ArrowRight'){cursorPos=min(working_text.length,cursorPos+1);e.preventDefault();return;}
+  if(e.key==='ArrowUp'){
+    e.preventDefault(); if(!consoleHistory.length) return;
+    if(consoleHistIdx===-1) consoleSaved=working_text;
+    consoleHistIdx=min(consoleHistory.length-1,consoleHistIdx+1);
+    inputSet(consoleHistory[consoleHistIdx]); return;
   }
   if(e.key==='ArrowDown'){
-    e.preventDefault();
-    if(consoleHistIdx===-1) return;
-    consoleHistIdx--;
-    inputSet(consoleHistIdx===-1 ? consoleSaved : consoleHistory[consoleHistIdx]);
-    return;
+    e.preventDefault(); if(consoleHistIdx===-1) return;
+    consoleHistIdx--; inputSet(consoleHistIdx===-1?consoleSaved:consoleHistory[consoleHistIdx]); return;
   }
-  if(e.key==='Backspace') { inputBackspace(); e.preventDefault(); return; }
-  if(e.key.length===1)    { inputInsert(e.key); e.preventDefault(); }
+  if(e.key==='Backspace'){inputBackspace();e.preventDefault();return;}
+  if(e.key.length===1){inputInsert(e.key);e.preventDefault();}
 });
 
-
+// ================================================================
+//  RESTORE FILE HANDLER
 // ================================================================
 document.getElementById('ri').addEventListener('change',e=>{
   const file=e.target.files[0]; if(!file) return;
@@ -1516,8 +1290,7 @@ document.getElementById('ri').addEventListener('change',e=>{
     try{
       const data=JSON.parse(ev.target.result);
       if(Array.isArray(data.history)){history.length=0;data.history.forEach(m=>pushMsg(m));}
-      if(data.users&&typeof data.users==='object')
-        Object.entries(data.users).forEach(([k,v])=>{ if(!users[k]) users[k]=v; });
+      if(data.users&&typeof data.users==='object') Object.entries(data.users).forEach(([k,v])=>{ if(!users[k]) users[k]=v; });
     }catch{}
   };
   reader.readAsText(file); e.target.value='';
