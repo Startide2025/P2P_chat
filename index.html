@@ -452,9 +452,6 @@ function setup(){ updateLayout(); createCanvas(MAXX,MAXY+HEADER_H+FOOTER_H); tex
 function windowResized(){ updateLayout(); resizeCanvas(MAXX,MAXY+HEADER_H+FOOTER_H); avatarGfxCache={}; }
 
 function keyPressed(){
-  // Let the native keydown listener handle all ctrl/meta combos —
-  // without this guard p5 would also insert the bare letter.
-  if(keyIsDown(CONTROL)||keyIsDown(91)||keyIsDown(93)) return false;
   if(appState==='setup') handleSetupKey();
   else{
     if(keyCode==ENTER){
@@ -860,7 +857,7 @@ document.addEventListener('keydown',e=>{
   if(appState==='setup'&&focusField&&ctrl){
     const val=getSetupField();
     if(e.key==='c'){ navigator.clipboard.writeText(val); e.preventDefault(); return; }
-    if(e.key==='x'){ setupRedo[focusField]=val; setupUndo[focusField]=val; setSetupField(''); e.preventDefault(); return; }
+    if(e.key==='x'){ setupUndo[focusField]=val; navigator.clipboard.writeText(val); setSetupField(''); e.preventDefault(); return; }
     if(e.key==='d'){ setupUndo[focusField]=val; setSetupField(''); e.preventDefault(); return; }
     if(e.key==='v'){ navigator.clipboard.readText().then(t=>{ setupUndo[focusField]=val; setSetupField(t.trim()); }); e.preventDefault(); return; }
     if(e.key==='z'){ const prev=setupUndo[focusField]||''; setupUndo[focusField]=val; setSetupField(prev); e.preventDefault(); return; }
