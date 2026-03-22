@@ -438,7 +438,6 @@ function drawSegments(segs,x,by,msgCol){
     textStyle(s.bold?BOLD:s.italic?ITALIC:NORMAL);
     textSize(fontSize); textAlign(LEFT,BASELINE);
     const w=textWidth(s.text);
-    const rT=by-fontSize+2, rH=fontSize+2;
     if(s.isUrl){
       fill(color(90,160,230)); text(s.text,x,by);
       stroke(color(90,160,230)); strokeWeight(0.5); line(x,by+1,x+w,by+1); noStroke();
@@ -448,8 +447,8 @@ function drawSegments(segs,x,by,msgCol){
       fill(msgCol); text(s.text,x,by);
     } else {
       fill(msgCol); text(s.text,x,by);
-      if(s.dim)   { noStroke(); fill(0,0,0,115);     rect(x-1,rT,w+2,rH); }
-      if(s.bright){ noStroke(); fill(255,255,255,60); rect(x-1,rT,w+2,rH); }
+      if(s.dim)   { noStroke(); fill(0,0,0,140);     text(s.text,x,by); }
+      if(s.bright){ noStroke(); fill(255,255,255,90); text(s.text,x,by); }
     }
     if(s.underline){ stroke(msgCol); strokeWeight(1); line(x,by+2,x+w,by+2); noStroke(); }
     if(s.strike)   { stroke(msgCol); strokeWeight(1); line(x,by-fontSize*0.35,x+w,by-fontSize*0.35); noStroke(); }
