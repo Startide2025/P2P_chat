@@ -97,7 +97,7 @@ function sanitizeAvatar(av){ if(!Array.isArray(av)||av.length!==64) return null;
 // ================================================================
 //  LAYOUT  (dynamic — recomputed on resize)
 // ================================================================
-const MARGX=20, MARGY=20, PADY=16, TBOXY=20;
+const MARGX=20, MARGY=20, TBOXY=20;
 const HEADER_H=28, FOOTER_H=36;
 const MBW=74, MBH=28, CBW=88, CBH=26;
 const SFH=28, FB_H=22;
@@ -106,6 +106,7 @@ const AV_CS=14, AV_PCW=13, AV_PCH=13;
 
 let fontSize=12;
 const FONT_MIN=8, FONT_MAX=24;
+function PADY(){ return fontSize+4; }
 
 let MAXX, MAXY, SFW, SB_X;
 let SY_TITLE, SY_TAG, SY_UNAME, SY_MBTNS, SY_CONT;
@@ -316,11 +317,11 @@ function doEditLast(name,newText){ for(let i=history.length-1;i>=0;i--){ const m
 //  HISTORY / SCROLL
 // ================================================================
 const HISTORY_LIMIT=200;
-function pushMsg(msg){ if(!msg.ts) msg.ts=Date.now(); const atBottom=scrollOffset===0; history.push(msg); if(history.length>HISTORY_LIMIT) history.splice(0,history.length-HISTORY_LIMIT); if(!atBottom){ scrollOffset+=PADY; clampScroll(); } }
+function pushMsg(msg){ if(!msg.ts) msg.ts=Date.now(); const atBottom=scrollOffset===0; history.push(msg); if(history.length>HISTORY_LIMIT) history.splice(0,history.length-HISTORY_LIMIT);     if(!atBottom){ scrollOffset+=PADY(); clampScroll(); } }
 
 let scrollOffset=0, linkRegions=[];
-function chatAreaH(){ return MAXY-TBOXY-PADY; }
-function getMaxScroll(){ return max(0,history.length*PADY-chatAreaH()); }
+function chatAreaH(){ return MAXY-TBOXY-PADY(); }
+function getMaxScroll(){ return max(0,history.length*PADY()-chatAreaH()); }
 function clampScroll(){ scrollOffset=constrain(scrollOffset,0,getMaxScroll()); }
 function mouseWheel(event){ if(appState!=='chat') return; scrollOffset=constrain(scrollOffset-event.delta,0,getMaxScroll()); return false; }
 
@@ -412,7 +413,7 @@ function drawSegments(segs,x,by,msgCol){
   textSize(fontSize); textAlign(LEFT,BASELINE);
   for(const s of segs){
     const w=textWidth(s.text);
-    if(s.isUrl){ fill(color(90,160,230)); text(s.text,x,by); stroke(color(90,160,230)); strokeWeight(0.5); line(x,by+1,x+w,by+1); noStroke(); linkRegions.push({url:s.text,x,y:by-PADY+3,w,h:PADY}); }
+    if(s.isUrl){ fill(color(90,160,230)); text(s.text,x,by); stroke(color(90,160,230)); strokeWeight(0.5); line(x,by+1,x+w,by+1); noStroke();     linkRegions.push({url:s.text,x,y:by-PADY()+3,w,h:PADY()}); }
     else        { fill(msgCol); text(s.text,x,by); }
     x+=w;
   }
@@ -474,13 +475,13 @@ function drawInput(){
   const lines=[]; let rem=working_text;
   while(rem.length>lineLen){ lines.push(rem.slice(0,lineLen)); rem=rem.slice(lineLen); }
   lines.push(rem);
-  const baseY=(MAXY+1.5*PADY)-TBOXY;
+  const baseY=(MAXY+1.5*PADY())-TBOXY;
   noStroke(); textAlign(LEFT,BASELINE);
-  if(authPending){ noStroke(); fill(color(80,55,20,60)); rect(0,baseY-PADY,MAXX,PADY+4); if(!working_text){ fill(color(160,120,50)); textSize(fontSize); textAlign(LEFT,BASELINE); text('/login <password>',MARGX,baseY-MARGY); return; } }
+  if(authPending){ noStroke(); fill(color(80,55,20,60)); rect(0,baseY-PADY(),MAXX,PADY()+4); if(!working_text){ fill(color(160,120,50)); textSize(fontSize); textAlign(LEFT,BASELINE); text('/login <password>',MARGX,baseY-MARGY); return; } }
   for(let i=0;i<lines.length;i++){
-    const y=baseY-(lines.length-1-i)*PADY-MARGY, start=i*lineLen, end=start+lines[i].length;
+    const y=baseY-(lines.length-1-i)*PADY()-MARGY, start=i*lineLen, end=start+lines[i].length;
     fill(200); text(lines[i],MARGX,y);
-    if(cursorPos>=start&&cursorPos<=end){ const cx=MARGX+textWidth(lines[i].slice(0,cursorPos-start)); if(blink){ fill(200); text('|',cx,y); } else { stroke(80); strokeWeight(1); line(cx,y,cx,y-PADY+3); noStroke(); } }
+    if(cursorPos>=start&&cursorPos<=end){ const cx=MARGX+textWidth(lines[i].slice(0,cursorPos-start)); if(blink){ fill(200); text('|',cx,y); } else { stroke(80); strokeWeight(1); line(cx,y,cx,y-PADY()+3); noStroke(); } }
   }
 }
 
@@ -493,7 +494,7 @@ function draw(){
     drawHeader(); drawFooter();
     push(); translate(0,HEADER_H);
     drawingContext.save(); drawingContext.beginPath(); drawingContext.rect(0,0,MAXX,MAXY); drawingContext.clip();
-    for(let i=0;i<history.length;i++){ const y=(MAXY-(history.length-1-i)*PADY)-TBOXY+scrollOffset; if(y-MARGY>MAXY+2||y-MARGY<-PADY) continue; renderText(history[i],y); }
+    for(let i=0;i<history.length;i++){ const y=(MAXY-(history.length-1-i)*PADY())-TBOXY+scrollOffset; if(y-MARGY>MAXY+2||y-MARGY<-PADY()) continue; renderText(history[i],y); }
     drawingContext.restore();
     for(const r of linkRegions){ if(mouseX>=r.x&&mouseX<=r.x+r.w&&mouseY-HEADER_H>=r.y&&mouseY-HEADER_H<=r.y+r.h){ cursor(HAND); break; } }
     drawInput();
