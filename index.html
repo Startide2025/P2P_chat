@@ -810,6 +810,7 @@ function handleChatClick(){
 //  SETUP KEY HANDLER
 // ================================================================
 function handleSetupKey(){
+  if(keyIsDown(CONTROL)||keyIsDown(91)||keyIsDown(93)) return; // let native listener handle ctrl combos
   if(keyCode===TAB){ const vis=setupMode==='profile'?['uname','color']:setupMode==='create'?['rname']:setupMode==='join'?['jroom']:[];if(vis.length)focusField=vis[(vis.indexOf(focusField)+1)%vis.length];return; }
   if(keyCode===ENTER){ if(setupMode==='create')doCreateRoom();else if(setupMode==='join')doJoinRoom();return; }
   if(keyCode===BACKSPACE){ if(focusField==='uname')fUname=fUname.slice(0,-1);else if(focusField==='rname')fRname=fRname.slice(0,-1);else if(focusField==='jroom')fJroom=fJroom.slice(0,-1);else if(focusField==='color')fColor=fColor.slice(0,-1);if(setupMode==='profile')saveProfile();return; }
