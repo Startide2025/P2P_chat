@@ -83,7 +83,7 @@ function colorFromId(id){ let h=5381; for(let i=0;i<id.length;i++) h=((h<<5)+h)^
 function resolvedColor(id){ const c=fColor.trim(); return c?c:colorFromId(id); }
 function broadcastToClients(data,exceptConn){ for(const c of clientConns) if(c!==exceptConn&&c.open) c.send(data); }
 function connForName(n){ for(const [c,nm] of clientConnNames) if(nm===n) return c; return null; }
-function sanitizeAvatar(av){ if(!Array.isArray(av)||av.length!==64) return null; if(av.some(c=>typeof c!=='string'||c.length>32)) return null; return av; }
+function sanitizeAvatar(av){ if(!Array.isArray(av)||av.length!==256) return null; if(av.some(c=>typeof c!=='string'||c.length>32)) return null; return av; }
 
 // ================================================================
 //  LAYOUT  — everything derived from fontSize/PADY
@@ -101,19 +101,21 @@ let SY_TITLE, SY_TAG, SY_UNAME, SY_MBTNS, SY_CONT;
 
 function updateLayout(){
   PADY     = fontSize + 4;
-  MARGX    = floor(PADY * 1.25);        // 20 at fs12
-  MARGY    = floor(PADY * 1.25);        // 20
-  TBOXY    = floor(PADY * 1.25);        // 20
-  SB_W     = max(3, floor(PADY * 0.25));// 4
-  HEADER_H = floor(PADY * 1.75);        // 28
-  FOOTER_H = floor(PADY * 2.25);        // 36
-  SFH      = floor(PADY * 1.75);        // 28
-  MBW      = floor(PADY * 4.625);       // 74
-  MBH      = floor(PADY * 1.75);        // 28
-  CBW      = floor(PADY * 5.5);         // 88
-  CBH      = floor(PADY * 1.625);       // 26
-  FB_H     = floor(PADY * 1.375);       // 22
-  AV_CS    = floor(PADY * 0.875);       // 14
+  MARGX    = floor(PADY * 1.25);
+  MARGY    = floor(PADY * 1.25);
+  TBOXY    = floor(PADY * 1.25);
+  SB_W     = max(3, floor(PADY * 0.25));
+  HEADER_H = floor(PADY * 1.75);
+  FOOTER_H = floor(PADY * 2.25);
+  SFH      = floor(PADY * 1.75);
+  MBW      = floor(PADY * 4.625);
+  MBH      = floor(PADY * 1.75);
+  CBW      = floor(PADY * 5.5);
+  CBH      = floor(PADY * 1.625);
+  FB_H     = floor(PADY * 1.375);
+  
+  // Adjusted Cell Size for 16x16 grid to prevent the editor from being too large
+  AV_CS    = floor(PADY * 0.55); 
   AV_PCW   = AV_CS - 1;
   AV_PCH   = AV_CS - 1;
 
@@ -343,17 +345,40 @@ function mouseWheel(event){ if(appState!=='chat') return; scrollOffset=constrain
 const AV_PALETTE=['ERASE',null,'#f0f0f0','#888888','#111111','#e05050','#e09030','#d4c830','#50b050','#40b8c0','#5060d0','#9050c8'];
 let fAvatar=null, avPalIdx=1, avatarGfxCache={};
 
-function initAvatarDefault(){ fAvatar=new Array(64).fill(resolvedColor('preview')); }
+function initAvatarDefault(){ fAvatar=new Array(256).fill(resolvedColor('preview')); }
 function getAvPaintColor(){ const p=AV_PALETTE[avPalIdx]; return p==='ERASE'?'':p===null?resolvedColor('preview'):p; }
 function invalidateAvatarCache(name){ delete avatarGfxCache[name]; }
-function getAvatarGfx(name){ const av=users[name]?.avatar; if(!av||!av.some(c=>c)) return null; const hash=av.join('|'); if(avatarGfxCache[name]?.hash===hash) return avatarGfxCache[name].pg; const pg=createGraphics(8,8); pg.noStroke(); pg.clear(); for(let r=0;r<8;r++) for(let c=0;c<8;c++){ const col=av[r*8+c]; if(col){pg.fill(col);pg.rect(c,r,1,1);} } avatarGfxCache[name]={pg,hash}; return pg; }
-function paintAvatarCell(mx,my,gx,gy){ const c=floor((mx-gx)/AV_CS), r=floor((my-gy)/AV_CS); if(c<0||c>7||r<0||r>7) return; if(!fAvatar) initAvatarDefault(); fAvatar[r*8+c]=mouseButton===RIGHT?'':getAvPaintColor(); saveProfile(); }
-
+function getAvatarGfx(name){ 
+  const av=users[name]?.avatar; 
+  if(!av||!av.some(c=>c)) return null; 
+  const hash=av.join('|'); 
+  if(avatarGfxCache[name]?.hash===hash) return avatarGfxCache[name].pg; 
+  
+  // Create a 16x16 graphics buffer
+  const pg=createGraphics(16,16); 
+  pg.noStroke(); 
+  pg.clear(); 
+  for(let r=0;r<16;r++) {
+    for(let c=0;c<16;c++){ 
+      const col=av[r*16+c]; 
+      if(col){pg.fill(col); pg.rect(c,r,1,1);} 
+    }
+  } 
+  avatarGfxCache[name]={pg,hash}; 
+  return pg; 
+}
+  function paintAvatarCell(mx,my,gx,gy){ 
+  const c=floor((mx-gx)/AV_CS), r=floor((my-gy)/AV_CS); 
+  if(c<0||c>15||r<0||r>15) return; // Bounds check for 16x16
+  if(!fAvatar) initAvatarDefault(); 
+  fAvatar[r*16+c]=mouseButton===RIGHT?'':getAvPaintColor(); 
+  saveProfile(); 
+}
 // ================================================================
 //  LOCALSTORAGE
 // ================================================================
 function saveProfile(){ try{ localStorage.setItem('profile',JSON.stringify({uname:fUname,color:fColor,avatar:fAvatar})); }catch(e){} }
-function loadProfile(){ try{ const p=JSON.parse(localStorage.getItem('profile')||'null'); if(p){fUname=p.uname||'';fColor=p.color||'';fAvatar=Array.isArray(p.avatar)&&p.avatar.length===64?p.avatar:null;} }catch(e){} }
+function loadProfile(){ try{ const p=JSON.parse(localStorage.getItem('profile')||'null');  if(p){ fUname=p.uname||''; fColor=p.color||''; fAvatar=Array.isArray(p.avatar)&&p.avatar.length===256?p.avatar:null;} }catch(e){} }
 function saveRoomHistory(rid){ try{ localStorage.setItem('room:'+rid,JSON.stringify(history.filter(m=>m.type!=='_hr'&&m.type!=='_help'))); }catch(e){} }
 function loadRoomHistory(rid){ try{ const s=JSON.parse(localStorage.getItem('room:'+rid)||'null'); if(Array.isArray(s)&&s.length>0){history.length=0;s.forEach(m=>pushMsg(m));return true;} }catch(e){} return false; }
 function loadCreatedRooms(){ try{return JSON.parse(localStorage.getItem('rooms:created')||'[]');}catch(e){return[];} }
